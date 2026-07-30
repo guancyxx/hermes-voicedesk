@@ -100,7 +100,10 @@ onMounted(async () => {
   }
 
   const u1 = await listen<{ state: VoiceState }>('audio:state', (event) => {
-    state.value = event.payload.state
+    // Don't override state transitions driven by the sentence TTS queue
+    if (!isTtsActive) {
+      state.value = event.payload.state
+    }
   })
 
   const u2 = await listen<{ rms: number; pct: number }>('audio:volume', (event) => {

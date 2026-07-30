@@ -72,7 +72,8 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
         // Only finalize if this generation is still the current one.
         // If a newer `speak()` superseded us, we must NOT touch the flags.
         if TTS_GENERATION.load(Ordering::SeqCst) == gen {
-            // BUG 1 fix: Tell frontend TTS actually finished (not a guess!)
+            // Tell frontend TTS actually finished so it can advance sentence queue
+            let _ = app.emit("tts:complete", serde_json::json!({}));
             let _ = app.emit("audio:state", serde_json::json!({"state": "listening"}));
 
             // Brief cooldown for residual echo before re-enabling mic
