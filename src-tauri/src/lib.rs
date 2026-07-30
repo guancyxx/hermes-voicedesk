@@ -70,6 +70,27 @@ fn notify_tts_end() {
 }
 
 #[tauri::command]
+fn start_wake_word(
+    app: tauri::AppHandle,
+    access_key: Option<String>,
+    keyword: Option<String>,
+) -> Result<(), String> {
+    audio::wake::start_wake_word(app, access_key, keyword);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_wake_word() -> Result<(), String> {
+    audio::wake::stop_wake_word();
+    Ok(())
+}
+
+#[tauri::command]
+fn get_wake_status() -> Result<bool, String> {
+    Ok(audio::wake::is_wake_detected())
+}
+
+#[tauri::command]
 fn transcribe_audio(path: String) -> Result<String, String> {
     stt::whisper::transcribe_file(&path, "base")
 }
@@ -152,6 +173,9 @@ pub fn run() {
             stop_speaking,
             notify_tts_start,
             notify_tts_end,
+            start_wake_word,
+            stop_wake_word,
+            get_wake_status,
             transcribe_audio,
             transcribe_audio_native,
         ])

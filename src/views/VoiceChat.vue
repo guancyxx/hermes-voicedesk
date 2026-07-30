@@ -7,20 +7,23 @@ import Transcription from '../components/Transcription.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import StateIndicator from '../components/StateIndicator.vue'
 
-type VoiceState = 'idle' | 'listening' | 'thinking' | 'responding' | 'speaking'
+type VoiceState = 'idle' | 'waiting' | 'listening' | 'thinking' | 'responding' | 'speaking'
 
 interface Message {
   role: 'user' | 'ai'
   text: string
 }
 
-const state = ref<VoiceState>('idle')
+const state = ref<VoiceState>('waiting')
 const userText = ref('')
 const messages = ref<Message[]>([])
 const apiConnected = ref(false)
 const isListening = ref(false)
 const volume = ref(0)
 const transcribedText = ref('')
+const wakeMode = ref<'vad' | 'porcupine' | ''>('')
+const wakeKeyword = ref('')
+const wakeEnabled = ref(true)
 
 // Session ID — date-based for grouping turns by day
 const sessionId = ref(`voice-${new Date().toISOString().slice(0, 10)}`)
@@ -71,7 +74,8 @@ function speakNextInQueue() {
   if (ttsQueue.length === 0) {
     isTtsActive = false
     if (responseFinished) {
-      state.value = 'idle'
+      // Go back to wake word mode instead of idle
+      enterWakeMode()
     }
     return
   }
@@ -91,6 +95,24 @@ function scrollToBottom() {
       chatArea.value.scrollTop = chatArea.value.scrollHeight
     }
   })
+}
+
+function enterWakeMode() {
+  if (!wakeEnabled.value) {
+    state.value = 'idle'
+    return
+  }
+  // Stop any active mic capture
+  invoke('stop_listening').catch(() => {})
+  isListening.value = false
+
+  // Start wake word detection
+  invoke('start_wake_word', {
+    accessKey: null,
+    keyword: 'picovoice',
+  }).catch((e) => console.error('start_wake_word failed:', e))
+
+  state.value = 'waiting'
 }
 
 let unlisteners: Array<() => void> = []
@@ -127,6 +149,33 @@ onMounted(async () => {
 
   const u2 = await listen<{ rms: number; pct: number }>('audio:volume', (event) => {
     volume.value = (event.payload.pct || event.payload.rms * 1000) / 100
+  })
+
+  // Wake word events
+  const u9 = await listen<{ state: string; mode: string; keyword: string }>(
+    'wake:state',
+    (event) => {
+      wakeMode.value = event.payload.mode as 'vad' | 'porcupine'
+      wakeKeyword.value = event.payload.keyword
+      state.value = 'waiting'
+    }
+  )
+
+  const u10 = await listen<{ keyword: string; mode?: string }>(
+    'wake:detected',
+    async () => {
+      // Wake word detected! Stop wake word and start listening.
+      invoke('stop_wake_word').catch(() => {})
+      // Small delay for clean transition
+      await new Promise((r) => setTimeout(r, 200))
+      await startListening()
+    }
+  )
+
+  const u11 = await listen<{ error: string }>('wake:error', (event) => {
+    console.error('Wake word error:', event.payload.error)
+    // Fall back to idle so user can manually listen
+    state.value = 'idle'
   })
 
   // Voice pipeline: audio captured → transcribed → Hermes
@@ -209,17 +258,18 @@ onMounted(async () => {
     }
 
     if (ttsQueue.length === 0 && !isTtsActive) {
-      state.value = 'idle'
+      // Go back to wake word mode
+      enterWakeMode()
     }
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
-    state.value = 'idle'
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
       lastMsg.text += `\n\nError: ${event.payload.error}`
     }
     responseFinished = true
+    enterWakeMode()
   })
 
   // TTS completion
@@ -227,25 +277,35 @@ onMounted(async () => {
     speakNextInQueue()
   })
 
-  unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8]
+  unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11]
+
+  // Auto-start wake word detection on app launch
+  enterWakeMode()
 })
 
 onUnmounted(() => {
   unlisteners.forEach((u) => u())
+  invoke('stop_wake_word').catch(() => {})
 })
+
+async function startListening() {
+  sentenceBuffer.value = ''
+  ttsQueue.length = 0
+  isTtsActive = false
+  responseFinished = false
+  await invoke('start_listening')
+  isListening.value = true
+}
 
 async function toggleListening() {
   if (isListening.value) {
     await invoke('stop_listening')
     isListening.value = false
-    state.value = 'idle'
+    enterWakeMode()
   } else {
-    sentenceBuffer.value = ''
-    ttsQueue.length = 0
-    isTtsActive = false
-    responseFinished = false
-    await invoke('start_listening')
-    isListening.value = true
+    // Stop wake word first
+    await invoke('stop_wake_word')
+    await startListening()
   }
 }
 
@@ -254,6 +314,9 @@ async function sendText() {
 
   const text = userText.value.trim()
   userText.value = ''
+
+  // Stop wake word
+  await invoke('stop_wake_word')
 
   // Add user message to chat history
   messages.value.push({ role: 'user', text })
@@ -270,11 +333,23 @@ async function sendText() {
   try {
     await invoke('hermes_chat_stream', { message: text })
   } catch (e) {
-    state.value = 'idle'
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
       lastMsg.text = `Error: ${e}`
     }
+    enterWakeMode()
+  }
+}
+
+async function toggleWake() {
+  wakeEnabled.value = !wakeEnabled.value
+  if (!wakeEnabled.value) {
+    await invoke('stop_wake_word')
+    await invoke('stop_listening')
+    isListening.value = false
+    state.value = 'idle'
+  } else {
+    enterWakeMode()
   }
 }
 </script>
@@ -282,16 +357,36 @@ async function sendText() {
 <template>
   <div class="voice-chat">
     <header class="chat-header">
-      <StateIndicator :state="state" :api-connected="apiConnected" />
-      <button class="btn-listen" :class="{ active: isListening }" @click="toggleListening">
-        {{ isListening ? '⏹ Stop' : '🎤 Listen' }}
-      </button>
+      <StateIndicator :state="state" :api-connected="apiConnected" :wake-mode="wakeMode" :wake-keyword="wakeKeyword" />
+      <div class="header-buttons">
+        <button
+          class="btn-wake"
+          :class="{ active: wakeEnabled }"
+          @click="toggleWake"
+          :title="wakeEnabled ? 'Wake word ON' : 'Wake word OFF'"
+        >
+          {{ wakeEnabled ? '🎯' : '🔇' }}
+        </button>
+        <button class="btn-listen" :class="{ active: isListening }" @click="toggleListening">
+          {{ isListening ? '⏹ Stop' : '🎤 Listen' }}
+        </button>
+      </div>
     </header>
 
     <AudioWave :active="state === 'listening'" :volume="volume" />
 
     <!-- Chat history — scrollable message bubbles area -->
     <div ref="chatArea" class="chat-area">
+      <!-- Wake word waiting indicator -->
+      <div v-if="state === 'waiting'" class="wake-waiting">
+        <div class="wake-pulse"></div>
+        <div class="wake-text">
+          <span v-if="wakeMode === 'porcupine'">Listening for "{{ wakeKeyword }}"...</span>
+          <span v-else>Speak to activate...</span>
+        </div>
+        <div class="wake-hint">Say something to start</div>
+      </div>
+
       <ChatBubble
         v-for="(msg, i) in messages"
         :key="i"
@@ -309,7 +404,7 @@ async function sendText() {
 
     <Transcription
       :text="userText"
-      :placeholder="state === 'listening' ? 'Listening...' : state === 'thinking' ? transcribedText || 'Processing...' : 'Type or speak...'"
+      :placeholder="state === 'listening' ? 'Listening...' : state === 'waiting' ? 'Say wake word or type...' : state === 'thinking' ? transcribedText || 'Processing...' : 'Type or speak...'"
       @update:text="userText = $event"
       @send="sendText"
     />
@@ -317,6 +412,9 @@ async function sendText() {
     <footer class="status-bar">
       <span class="status-dot" :class="{ connected: apiConnected }"></span>
       Hermes API {{ apiConnected ? 'Connected' : 'Disconnected' }}
+      <span v-if="wakeEnabled" class="wake-indicator">
+        | Wake: {{ wakeMode === 'porcupine' ? `"${wakeKeyword}"` : 'VAD' }}
+      </span>
       <span v-if="isListening" class="mic-level">| Mic: {{ (volume * 100).toFixed(0) }}%</span>
     </footer>
   </div>
@@ -342,6 +440,12 @@ async function sendText() {
   flex-shrink: 0;
 }
 
+.header-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .btn-listen {
   padding: 8px 20px;
   border-radius: 20px;
@@ -361,6 +465,68 @@ async function sendText() {
 
 .btn-listen:hover {
   opacity: 0.9;
+}
+
+.btn-wake {
+  padding: 6px 10px;
+  border-radius: 20px;
+  border: 1px solid #4a4a8a;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  transition: all 0.2s;
+  line-height: 1;
+}
+
+.btn-wake.active {
+  border-color: #6c5ce7;
+  background: rgba(108, 92, 231, 0.15);
+}
+
+.btn-wake:hover {
+  opacity: 0.9;
+}
+
+/* Wake word waiting indicator */
+.wake-waiting {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 16px;
+  gap: 16px;
+  opacity: 0.8;
+}
+
+.wake-pulse {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: rgba(108, 92, 231, 0.15);
+  border: 2px solid rgba(108, 92, 231, 0.4);
+  animation: wakePulse 2s ease-in-out infinite;
+}
+
+.wake-text {
+  font-size: 16px;
+  color: #a0a0d0;
+  text-align: center;
+}
+
+.wake-hint {
+  font-size: 12px;
+  color: #666;
+}
+
+@keyframes wakePulse {
+  0%, 100% {
+    transform: scale(0.9);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 1;
+  }
 }
 
 /* Chat area — scrollable message list */
@@ -431,6 +597,10 @@ async function sendText() {
 }
 
 .mic-level {
+  color: #6c5ce7;
+}
+
+.wake-indicator {
   color: #6c5ce7;
 }
 

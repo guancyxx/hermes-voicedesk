@@ -2,10 +2,13 @@
 defineProps<{
   state: string
   apiConnected: boolean
+  wakeMode?: string
+  wakeKeyword?: string
 }>()
 
 const stateLabels: Record<string, string> = {
   idle: 'Ready',
+  waiting: 'Waiting...',
   listening: 'Listening...',
   thinking: 'Thinking...',
   responding: 'Responding...',
@@ -17,7 +20,10 @@ const stateLabels: Record<string, string> = {
   <div class="state-indicator">
     <div class="state-pill" :class="state">
       <span class="state-dot"></span>
-      {{ stateLabels[state] || state }}
+      <span>{{ stateLabels[state] || state }}</span>
+      <span v-if="state === 'waiting' && wakeKeyword" class="wake-subtitle">
+        "{{ wakeKeyword }}"
+      </span>
     </div>
   </div>
 </template>
@@ -47,8 +53,20 @@ const stateLabels: Record<string, string> = {
 }
 
 .state-pill.idle .state-dot { background: #888; }
+.state-pill.waiting .state-dot { background: #6c5ce7; animation: wake-pulse 2s infinite; }
 .state-pill.listening .state-dot { background: #6c5ce7; animation: pulse 1s infinite; }
 .state-pill.thinking .state-dot { background: #f39c12; animation: pulse 1s infinite; }
 .state-pill.responding .state-dot { background: #3498db; }
 .state-pill.speaking .state-dot { background: #2ecc71; }
+
+.wake-subtitle {
+  font-size: 11px;
+  color: #888;
+  font-style: italic;
+}
+
+@keyframes wake-pulse {
+  0%, 100% { opacity: 0.4; box-shadow: 0 0 4px rgba(108, 92, 231, 0.3); }
+  50% { opacity: 1; box-shadow: 0 0 12px rgba(108, 92, 231, 0.6); }
+}
 </style>
