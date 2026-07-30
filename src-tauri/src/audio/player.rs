@@ -12,10 +12,10 @@
 /// - After TTS finishes, a cooldown delay is observed before `capture::resume_mic()`
 ///   is called, ensuring residual reverb/echo has subsided.
 ///
-/// State management (BUG 1 fix):
-/// - When TTS finishes, an `audio:state {state: "listening"}` event is emitted to the
-///   frontend so it can transition from "speaking" back to "listening" at the right time
-///   (instead of the previous hardcoded 1-second timeout).
+/// State management:
+/// - When TTS finishes, an `audio:state {state: "idle"}` event is emitted to the
+///   frontend so it can transition from "speaking" to "idle". The user must
+///   explicitly click "Listen" again for each conversation round.
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -36,8 +36,8 @@ static CURRENT_SAY: Mutex<Option<Child>> = Mutex::new(None);
 /// Kills any in-progress `say` before starting. Returns immediately;
 /// the actual speech runs on a background thread.
 ///
-/// When TTS finishes, emits `audio:state {state: "listening"}` so the frontend
-/// can transition UI state at the right time.
+/// When TTS finishes, emits `audio:state {state: "idle"}` so the frontend
+/// transitions to idle — user must explicitly click Listen again.
 pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     // 1. Kill the previous `say` process if one is running
     stop_say_process();
@@ -74,7 +74,7 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
         if TTS_GENERATION.load(Ordering::SeqCst) == gen {
             // Tell frontend TTS actually finished so it can advance sentence queue
             let _ = app.emit("tts:complete", serde_json::json!({}));
-            let _ = app.emit("audio:state", serde_json::json!({"state": "listening"}));
+            let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
 
             // Brief cooldown for residual echo before re-enabling mic
             std::thread::sleep(std::time::Duration::from_millis(500));

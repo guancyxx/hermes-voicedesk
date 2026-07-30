@@ -70,10 +70,8 @@ function enqueueSentence(sentence: string) {
 function speakNextInQueue() {
   if (ttsQueue.length === 0) {
     isTtsActive = false
-    // If the full response has finished and the queue is drained, go back to listening
-    if (responseFinished && isListening.value) {
-      state.value = 'listening'
-    } else if (responseFinished) {
+    // If the full response has finished and the queue is drained, go to idle
+    if (responseFinished) {
       state.value = 'idle'
     }
     return
@@ -169,13 +167,9 @@ onMounted(async () => {
       sentenceBuffer.value = ''
     }
 
-    // If nothing is queued and nothing is speaking, go back to listening
+    // If nothing is queued and nothing is speaking, go to idle
     if (ttsQueue.length === 0 && !isTtsActive) {
-      if (isListening.value) {
-        state.value = 'listening'
-      } else {
-        state.value = 'idle'
-      }
+      state.value = 'idle'
     }
     // Otherwise the queue processor (tts:complete listener) will handle the transition
   })
