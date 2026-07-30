@@ -48,6 +48,16 @@ fn stop_speaking() -> Result<(), String> {
     audio::player::stop()
 }
 
+#[tauri::command]
+fn transcribe_audio(path: String) -> Result<String, String> {
+    stt::whisper::transcribe_file(&path, "base")
+}
+
+#[tauri::command]
+fn transcribe_audio_native(path: String) -> Result<String, String> {
+    stt::apple::transcribe_file(&path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -136,6 +146,8 @@ pub fn run() {
             stop_listening,
             speak_text,
             stop_speaking,
+            transcribe_audio,
+            transcribe_audio_native,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes VoiceDesk");

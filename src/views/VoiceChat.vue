@@ -15,50 +15,87 @@ const aiText = ref('')
 const toolCalls = ref<Array<{ tool: string; status: string }>>([])
 const apiConnected = ref(false)
 const isListening = ref(false)
+const volume = ref(0)
+const transcribedText = ref('')
 
 let unlisteners: Array<() => void> = []
 
 onMounted(async () => {
-  // Check Hermes API health
   try {
     apiConnected.value = await invoke('check_hermes_api')
   } catch {
     apiConnected.value = false
   }
 
-  // Listen to audio state changes
   const u1 = await listen<{ state: VoiceState }>('audio:state', (event) => {
     state.value = event.payload.state
   })
 
-  // Listen to Hermes streaming deltas
-  const u2 = await listen<{ content: string }>('hermes:delta', (event) => {
+  const u2 = await listen<{ rms: number }>('audio:volume', (event) => {
+    volume.value = event.payload.rms
+  })
+
+  // Voice pipeline: audio captured → transcribe → Hermes
+  const u3 = await listen<{ path: string }>('stt:audio_file', async (event) => {
+    state.value = 'thinking'
+    transcribedText.value = 'Transcribing...'
+
+    try {
+      // Try faster-whisper first, fall back to empty
+      let text = ''
+      try {
+        text = await invoke<string>('transcribe_audio', { path: event.payload.path })
+      } catch {
+        // Whisper not available, use placeholder
+        text = '[Speech detected — STT engine not available]'
+      }
+
+      transcribedText.value = text
+      if (text && text.trim()) {
+        userText.value = text
+      }
+
+      // Send to Hermes
+      aiText.value = ''
+      toolCalls.value = []
+      state.value = 'thinking'
+
+      await invoke('hermes_chat_stream', { message: text || 'Hello' })
+    } catch (e) {
+      state.value = 'idle'
+      aiText.value = `Error: ${e}`
+    }
+  })
+
+  const u4 = await listen<{ content: string }>('hermes:delta', (event) => {
     state.value = 'responding'
     aiText.value += event.payload.content
   })
 
-  // Listen to tool calls
-  const u3 = await listen<{ tool: string; status: string; error?: boolean }>('hermes:tool', (event) => {
+  const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
     toolCalls.value.push({
       tool: event.payload.tool,
       status: event.payload.status,
     })
   })
 
-  // Listen to finish
-  const u4 = await listen('hermes:finish', () => {
+  const u6 = await listen('hermes:finish', () => {
     state.value = 'speaking'
-    // Trigger TTS
     invoke('speak_text', { text: aiText.value })
+    // After TTS, go back to listening if still in voice mode
+    setTimeout(() => {
+      if (isListening.value && state.value === 'speaking') {
+        state.value = 'listening'
+      }
+    }, 1000)
   })
 
-  // Listen to errors
-  const u5 = await listen<{ error: string }>('hermes:error', (event) => {
+  const u7 = await listen<{ error: string }>('hermes:error', (event) => {
     state.value = 'idle'
-    aiText.value += `\n\n❌ Error: ${event.payload.error}`
+    aiText.value += `\n\nError: ${event.payload.error}`
   })
 
-  unlisteners = [u1, u2, u3, u4, u5]
+  unlisteners = [u1, u2, u3, u4, u5, u6, u7]
 })
 
 onUnmounted(() => {
@@ -71,9 +108,10 @@ async function toggleListening() {
     isListening.value = false
     state.value = 'idle'
   } else {
+    aiText.value = ''
+    toolCalls.value = []
     await invoke('start_listening')
     isListening.value = true
-    state.value = 'listening'
   }
 }
 
@@ -97,7 +135,6 @@ async function sendText() {
 
 <template>
   <div class="voice-chat">
-    <!-- Header -->
     <header class="chat-header">
       <StateIndicator :state="state" :api-connected="apiConnected" />
       <button class="btn-listen" :class="{ active: isListening }" @click="toggleListening">
@@ -105,28 +142,25 @@ async function sendText() {
       </button>
     </header>
 
-    <!-- Audio Waveform -->
-    <AudioWave :active="state === 'listening'" />
+    <AudioWave :active="state === 'listening'" :volume="volume" />
 
-    <!-- Transcription -->
     <Transcription
       :text="userText"
-      :placeholder="state === 'listening' ? 'Listening...' : 'Type or speak...'"
+      :placeholder="state === 'listening' ? 'Listening...' : state === 'thinking' ? transcribedText || 'Processing...' : 'Type or speak...'"
       @update:text="userText = $event"
       @send="sendText"
     />
 
-    <!-- AI Response -->
     <ResponseCard
       :text="aiText"
       :tool-calls="toolCalls"
       :state="state"
     />
 
-    <!-- Status bar -->
     <footer class="status-bar">
       <span class="status-dot" :class="{ connected: apiConnected }"></span>
       Hermes API {{ apiConnected ? 'Connected' : 'Disconnected' }}
+      <span v-if="isListening" class="mic-level">| Mic: {{ (volume * 100).toFixed(0) }}%</span>
     </footer>
   </div>
 </template>
@@ -191,5 +225,9 @@ async function sendText() {
 
 .status-dot.connected {
   background: #2ecc71;
+}
+
+.mic-level {
+  color: #6c5ce7;
 }
 </style>

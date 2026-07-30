@@ -30,6 +30,7 @@ tauri-plugin-fs = "2"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
-# Audio: will be added as modules are implemented
-# cpal = "0.15"
-# ort = "2.0.0-rc.13"  # ONNX Runtime for silero-vad
+# Audio
+cpal = "0.18"
+# ort = "2.0.0-rc.13"  # ONNX Runtime for silero-vad (Phase 1.5)
+ringbuf = "0.4"
