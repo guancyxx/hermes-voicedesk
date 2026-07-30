@@ -120,8 +120,8 @@ function speakNextInQueue() {
   // Reveal sentence in chat bubble AS TTS starts (text appears with audio)
   if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
     messages.value[messages.value.length - 1].text += sentence
+    scrollToBottom()
   }
-  scrollToBottom()
 
   invoke('speak_text', { text: sentence }).catch((e) => {
     console.error('speak_text failed:', e)
@@ -301,7 +301,7 @@ onMounted(async () => {
       enqueueSentence(s)
     }
     sentenceBuffer.value = remainder
-    // NO scrollToBottom here — scroll happens when sentences are revealed in speakNextInQueue()
+    scrollToBottom()
   })
 
   const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
