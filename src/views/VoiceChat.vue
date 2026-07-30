@@ -35,6 +35,7 @@ const chatArea = ref<HTMLElement | null>(null)
 const sentenceBuffer = ref('')
 const ttsQueue: string[] = []
 let isTtsActive = false
+let isProcessing = false
 let responseFinished = false
 
 // Regex for sentence-ending boundaries
@@ -98,6 +99,7 @@ function scrollToBottom() {
 }
 
 function enterWakeMode() {
+  console.log(`[VoiceChat] enterWakeMode (wakeEnabled=${wakeEnabled.value})`)
   if (!wakeEnabled.value) {
     state.value = 'idle'
     return
@@ -142,8 +144,11 @@ onMounted(async () => {
   }
 
   const u1 = await listen<{ state: VoiceState }>('audio:state', (event) => {
-    if (!isTtsActive) {
+    if (!isTtsActive && !isProcessing) {
+      console.log(`[VoiceChat] audio:state → ${event.payload.state} (applied)`)
       state.value = event.payload.state
+    } else {
+      console.log(`[VoiceChat] audio:state → ${event.payload.state} (ignored: isTtsActive=${isTtsActive}, isProcessing=${isProcessing})`)
     }
   })
 
@@ -181,8 +186,12 @@ onMounted(async () => {
   // Voice pipeline: audio captured → transcribed → Hermes
   const u3 = await listen<{ text: string }>('stt:result', async (event) => {
     const text = event.payload.text
+    console.log(`[VoiceChat] stt:result text="${text}"`)
     if (!text || text.startsWith('[')) {
-      state.value = 'listening'
+      console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
+      messages.value.push({ role: 'ai', text: "Sorry, I didn't catch that." })
+      scrollToBottom()
+      state.value = 'idle'
       return
     }
 
@@ -199,12 +208,17 @@ onMounted(async () => {
     messages.value.push({ role: 'ai', text: '' })
     scrollToBottom()
 
+    console.log(`[VoiceChat] → hermes_chat_stream: "${text}"`)
+    isProcessing = true
     state.value = 'thinking'
 
     try {
       await invoke('hermes_chat_stream', { message: text })
+      isProcessing = false
     } catch (e) {
+      isProcessing = false
       state.value = 'idle'
+      console.error(`[VoiceChat] hermes_chat_stream error:`, e)
       const lastMsg = messages.value[messages.value.length - 1]
       if (lastMsg && lastMsg.role === 'ai') {
         lastMsg.text = `Error: ${e}`
@@ -289,9 +303,11 @@ onUnmounted(() => {
 })
 
 async function startListening() {
+  console.log('[VoiceChat] startListening')
   sentenceBuffer.value = ''
   ttsQueue.length = 0
   isTtsActive = false
+  isProcessing = false
   responseFinished = false
   await invoke('start_listening')
   isListening.value = true
@@ -328,11 +344,14 @@ async function sendText() {
   ttsQueue.length = 0
   isTtsActive = false
   responseFinished = false
+  isProcessing = true
   state.value = 'thinking'
 
   try {
     await invoke('hermes_chat_stream', { message: text })
+    isProcessing = false
   } catch (e) {
+    isProcessing = false
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
       lastMsg.text = `Error: ${e}`

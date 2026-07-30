@@ -238,10 +238,13 @@ pub async fn stop_mic_capture() -> Result<(), String> {
 fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     use std::io::Write;
 
+    let duration_secs = audio.len() as f32 / sample_rate as f32;
+    log::info!("STT: attempt start — {} samples, {:.2}s", audio.len(), duration_secs);
+
     // ── Edge case 1: Empty or near-empty audio ──
     if audio.len() < sample_rate as usize / 10 {
         // Audio shorter than 100ms — likely a click or noise spike
-        log::debug!("STT: skipping clip too short ({} samples, {:.2}s)", audio.len(), audio.len() as f32 / sample_rate as f32);
+        log::info!("STT: skipping clip too short ({} samples, {:.2}s)", audio.len(), duration_secs);
         let _ = app.emit("stt:result", serde_json::json!({ "text": "[too short]", "confidence": 0.0 }));
         return;
     }
@@ -253,7 +256,7 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     };
     if rms < 0.002 {
         // Very quiet — likely silence or room tone
-        log::debug!("STT: skipping near-silent clip (RMS={:.6})", rms);
+        log::info!("STT: skipping near-silent clip (RMS={:.6})", rms);
         let _ = app.emit("stt:result", serde_json::json!({ "text": "[silence]", "confidence": 0.0 }));
         return;
     }
@@ -313,7 +316,7 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
             return;
         }
         None => {
-            log::warn!("STT: both Siri and whisper failed");
+            log::info!("STT: both Siri and whisper failed");
         }
     }
 
