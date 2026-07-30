@@ -49,6 +49,16 @@ fn stop_speaking() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn notify_tts_start() {
+    audio::capture::notify_tts_start();
+}
+
+#[tauri::command]
+fn notify_tts_end() {
+    audio::capture::notify_tts_end();
+}
+
+#[tauri::command]
 fn transcribe_audio(path: String) -> Result<String, String> {
     stt::whisper::transcribe_file(&path, "base")
 }
@@ -127,6 +137,8 @@ pub fn run() {
             stop_listening,
             speak_text,
             stop_speaking,
+            notify_tts_start,
+            notify_tts_end,
             transcribe_audio,
             transcribe_audio_native,
         ])

@@ -32,8 +32,8 @@ onMounted(async () => {
     state.value = event.payload.state
   })
 
-  const u2 = await listen<{ rms: number }>('audio:volume', (event) => {
-    volume.value = event.payload.rms
+  const u2 = await listen<{ rms: number; pct: number }>('audio:volume', (event) => {
+    volume.value = (event.payload.pct || event.payload.rms * 1000) / 100
   })
 
   // Voice pipeline: audio captured → transcribed → Hermes
@@ -44,6 +44,9 @@ onMounted(async () => {
       state.value = 'listening'
       return
     }
+
+    // User is speaking — immediately stop any in-progress TTS
+    invoke('stop_speaking').catch(() => {})
 
     userText.value = text
     aiText.value = ''
@@ -72,7 +75,10 @@ onMounted(async () => {
 
   const u6 = await listen('hermes:finish', () => {
     state.value = 'speaking'
-    invoke('speak_text', { text: aiText.value })
+    // Kill any previous TTS before starting new speech
+    invoke('stop_speaking').then(() => {
+      invoke('speak_text', { text: aiText.value })
+    })
     // After TTS, go back to listening if still in voice mode
     setTimeout(() => {
       if (isListening.value && state.value === 'speaking') {
