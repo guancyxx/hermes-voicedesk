@@ -8,6 +8,9 @@ use tauri::{AppHandle, Emitter};
 const HERMES_API_BASE: &str = "http://127.0.0.1:8642";
 const HERMES_API_KEY: &str = "shujietai-dev-key-2026";
 
+/// JARVIS persona injected as system prompt on every request.
+const JARVIS_INSTRUCTIONS: &str = include_str!("../resources/jarvis-persona.md");
+
 /// Build a reqwest client that bypasses system proxy (critical for localhost).
 fn api_client() -> Result<Client, String> {
     Client::builder()
@@ -42,7 +45,10 @@ pub async fn check_health() -> Result<bool, String> {
 /// Send a chat message and get the full response.
 pub async fn chat(message: &str, session_id: Option<&str>) -> Result<String, String> {
     let client = api_client()?;
-    let mut payload = serde_json::json!({ "input": message });
+    let mut payload = serde_json::json!({
+        "input": message,
+        "instructions": JARVIS_INSTRUCTIONS,
+    });
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }
@@ -103,7 +109,10 @@ pub async fn chat_stream(
     app: AppHandle,
 ) -> Result<(), String> {
     let client = api_client()?;
-    let mut payload = serde_json::json!({ "input": message });
+    let mut payload = serde_json::json!({
+        "input": message,
+        "instructions": JARVIS_INSTRUCTIONS,
+    });
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }

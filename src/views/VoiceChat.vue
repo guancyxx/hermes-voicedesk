@@ -257,8 +257,7 @@ onMounted(async () => {
 
     // Add user message to chat history
     messages.value.push({ role: 'user', text })
-    // Add placeholder for AI response
-    messages.value.push({ role: 'ai', text: '' })
+    // AI placeholder pushed lazily on first hermes:delta
     scrollToBottom()
 
     console.log(`[VoiceChat] → hermes_chat_stream: "${text}"`)
@@ -284,6 +283,11 @@ onMounted(async () => {
   // Streaming delta — accumulate into hidden buffer, do NOT reveal in chat yet.
   // Sentences appear in the chat bubble from speakNextInQueue() when TTS starts playing them.
   const u4 = await listen<{ content: string }>('hermes:delta', (event) => {
+    // Push AI message placeholder lazily on first delta (was empty bubble from stt:result)
+    const lastMsg = messages.value[messages.value.length - 1]
+    if (!lastMsg || lastMsg.role !== 'ai') {
+      messages.value.push({ role: 'ai', text: '' })
+    }
     state.value = 'responding'
 
     // Accumulate into the hidden full-response buffer (used for history save)
@@ -418,8 +422,7 @@ async function sendText() {
 
   // Add user message to chat history
   messages.value.push({ role: 'user', text })
-  // Add placeholder for AI response
-  messages.value.push({ role: 'ai', text: '' })
+  // AI placeholder pushed lazily on first hermes:delta
   scrollToBottom()
 
   sentenceBuffer.value = ''
