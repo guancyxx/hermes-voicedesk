@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Hermes VoiceDesk",
+  "version": "0.1.0",
+  "identifier": "com.guancyxx.hermes-voicedesk",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Hermes VoiceDesk",
+        "label": "main",
+        "width": 420,
+        "height": 680,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "minWidth": 360,
+        "minHeight": 500,
+        "decorations": true,
+        "transparent": false,
+        "visible": true
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "tooltip": "Hermes VoiceDesk",
+      "menuOnLeftClick": false
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": false,
+    "category": "Productivity",
+    "shortDescription": "Real-time voice AI desktop assistant",
+    "longDescription": "Hermes VoiceDesk — A desktop window app for real-time voice conversation with Hermes Agent AI. Features system tray, global hotkey, and natural voice interaction.",
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

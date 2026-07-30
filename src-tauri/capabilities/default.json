@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Hermes VoiceDesk default permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "global-shortcut:default",
+    "notification:default",
+    "dialog:default",
+    "shell:default",
+    "process:default",
+    "fs:default",
+    {
+      "identifier": "global-shortcut:allow-register",
+      "allow": [{ "shortcut": "Option+Space" }]
+    },
+    {
+      "identifier": "global-shortcut:allow-is-registered",
+      "allow": [{ "shortcut": "Option+Space" }]
+    },
+    {
+      "identifier": "global-shortcut:allow-unregister",
+      "allow": [{ "shortcut": "Option+Space" }]
+    }
+  ]
+}
