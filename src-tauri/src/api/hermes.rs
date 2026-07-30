@@ -9,7 +9,7 @@ const HERMES_API_BASE: &str = "http://127.0.0.1:8642";
 const HERMES_API_KEY: &str = "shujietai-dev-key-2026";
 
 /// JARVIS persona injected as system prompt on every request.
-const JARVIS_INSTRUCTIONS: &str = include_str!("../resources/jarvis-persona.md");
+const JARVIS_INSTRUCTIONS: &str = include_str!("../../resources/jarvis-persona.md");
 
 /// Build a reqwest client that bypasses system proxy (critical for localhost).
 fn api_client() -> Result<Client, String> {
