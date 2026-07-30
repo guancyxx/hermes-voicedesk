@@ -218,10 +218,16 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            if cfg!(debug_assertions) {
+            // Enable logging in all modes — needed for wake word debugging
+            {
+                let level = if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                };
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
+                        .level(level)
                         .build(),
                 )?;
             }

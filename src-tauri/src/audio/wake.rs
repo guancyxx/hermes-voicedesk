@@ -35,7 +35,7 @@ pub fn start_wake_word(app: AppHandle, access_key: Option<String>, keyword: Opti
         }
     }
 
-    log::info!("No Picovoice key — using VAD-based speech activation");
+    log::info!("No Picovoice key — using VAD-based speech activation (keyword={})", kw);
     spawn_vad_wake(app);
 }
 
@@ -62,6 +62,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
 
     std::thread::spawn(move || {
         let script_path = find_script_path("wake_word.py");
+        log::info!("Porcupine script path: {:?}", script_path);
 
         let mut child = match Command::new("python3")
             .arg(script_path.as_os_str())
@@ -79,7 +80,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                 log::error!("Failed to spawn wake word detector: {}", e);
                 let _ = app_handle.emit(
                     "wake:error",
-                    serde_json::json!({"error": format!("{}", e)}),
+                    serde_json::json!({"error": format!("Failed to spawn: {}", e)}),
                 );
                 WAKE_ACTIVE.store(false, Ordering::SeqCst);
                 return;
@@ -96,6 +97,9 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                 return;
             }
         };
+
+        // Also capture stderr for debugging
+        let stderr = child.stderr.take();
 
         // Keep child handle for cleanup when WAKE_ACTIVE goes false
         let child_handle = Arc::new(Mutex::new(Some(child)));
@@ -120,11 +124,26 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
             }
         });
 
+        // Spawn a stderr reader thread
+        if let Some(stderr) = stderr {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.is_empty() => {
+                            log::warn!("Porcupine stderr: {}", l);
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+
         let reader = BufReader::new(stdout);
 
         let _ = app_handle.emit(
             "wake:state",
-            serde_json::json!({"state": "waiting", "mode": "porcupine", "keyword": kw}),
+            serde_json::json!({"state": "waiting", "mode": "porcupine", "keyword": kw.clone()}),
         );
 
         for line in reader.lines() {
@@ -134,7 +153,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
 
             match line {
                 Ok(l) => {
-                    log::debug!("Porcupine output: {}", l);
+                    log::info!("Porcupine output: {}", l);
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(&l) {
                         let etype = event
                             .get("event")
@@ -142,18 +161,38 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                             .unwrap_or("");
                         match etype {
                             "ready" => {
-                                log::info!("Porcupine ready");
+                                let mode = event
+                                    .get("mode")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("porcupine");
+                                log::info!("Porcupine ready (mode={})", mode);
+                            }
+                            "debug" => {
+                                // Debug messages from the Python script
+                                let msg = event
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                log::debug!("Porcupine debug: {}", msg);
                             }
                             "wake_word" => {
                                 let detected = event
                                     .get("keyword")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("jarvis");
-                                log::info!("Wake word detected: {}", detected);
+                                let mode = event
+                                    .get("mode")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("porcupine");
+                                log::info!(
+                                    "Wake word detected: {} (mode={})",
+                                    detected,
+                                    mode
+                                );
                                 WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
                                 let _ = app_handle.emit(
                                     "wake:detected",
-                                    serde_json::json!({"keyword": detected}),
+                                    serde_json::json!({"keyword": detected, "mode": mode}),
                                 );
                                 WAKE_ACTIVE.store(false, Ordering::SeqCst);
                                 break;
@@ -173,6 +212,8 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                             }
                             _ => {}
                         }
+                    } else {
+                        log::debug!("Porcupine non-JSON output: {}", l);
                     }
                 }
                 Err(e) => {
@@ -226,21 +267,48 @@ fn spawn_vad_wake(app: AppHandle) {
         };
 
         let sample_rate = supported_cfg.sample_rate();
-        log::info!("VAD wake: {}Hz microphone", sample_rate);
+        log::info!(
+            "VAD wake: {}Hz microphone, config={:?}",
+            sample_rate,
+            supported_cfg
+        );
 
         let config = supported_cfg.config().clone();
 
         // Shared state for the audio callback
         let speech_frames = Arc::new(AtomicU32::new(0));
         let silence_frames = Arc::new(AtomicU32::new(0));
+        let last_rms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let speech_frames_cb = speech_frames.clone();
         let silence_frames_cb = silence_frames.clone();
+        let last_rms_cb = last_rms.clone();
         let app_cb = app_handle.clone();
+
+        // VAD parameters (tuned for reliable speech detection)
+        // RMS threshold: 0.005 is sensitive enough for normal speech at arm's length
+        const RMS_THRESHOLD: f64 = 0.005;
+        // Frames of sustained speech needed to trigger (~1.0s at 30ms frames)
+        const TRIGGER_FRAMES: u32 = 33;
+        // Silence frames needed to reset the counter (~1.5s)
+        const SILENCE_RESET_FRAMES: u32 = 50;
 
         let _ = app_handle.emit(
             "wake:state",
-            serde_json::json!({"state": "waiting", "mode": "vad", "keyword": "[any speech]"}),
+            serde_json::json!({
+                "state": "waiting",
+                "mode": "vad",
+                "keyword": "[any speech]",
+                "rms_threshold": RMS_THRESHOLD,
+                "trigger_frames": TRIGGER_FRAMES,
+            }),
+        );
+
+        log::info!(
+            "VAD wake: RMS threshold={}, trigger={} frames (~{:.1}s)",
+            RMS_THRESHOLD,
+            TRIGGER_FRAMES,
+            TRIGGER_FRAMES as f64 * 0.03,
         );
 
         let stream = match device.build_input_stream(
@@ -252,28 +320,49 @@ fn spawn_vad_wake(app: AppHandle) {
 
                 let sum: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
                 let rms = (sum / data.len() as f64).sqrt();
-                let is_speech = rms > 0.015;
+                let is_speech = rms > RMS_THRESHOLD;
+
+                // Store RMS for debug (as fixed-point u64: integer part + 6 decimal places)
+                last_rms_cb.store((rms * 1_000_000.0) as u64, Ordering::Relaxed);
 
                 if is_speech {
                     let sf = speech_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
                     silence_frames_cb.store(0, Ordering::SeqCst);
 
-                    // ~1.5 seconds of sustained speech triggers activation
-                    // At typical 30ms frames: ~50 frames/sec, so ~75 frames
-                    if sf >= 75 {
-                        log::info!("VAD wake: speech detected ({} frames)", sf);
+                    // Log progress every 10 frames
+                    if sf % 10 == 0 {
+                        log::debug!(
+                            "VAD wake: speech frame {}/{} (RMS={:.6})",
+                            sf,
+                            TRIGGER_FRAMES,
+                            rms
+                        );
+                    }
+
+                    if sf >= TRIGGER_FRAMES {
+                        log::info!(
+                            "VAD wake: speech detected ({} frames, RMS={:.6})",
+                            sf,
+                            rms
+                        );
                         WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
                         let _ = app_cb.emit(
                             "wake:detected",
-                            serde_json::json!({"keyword": "[speech]", "mode": "vad"}),
+                            serde_json::json!({"keyword": "[speech]", "mode": "vad", "rms": rms, "frames": sf}),
                         );
                         WAKE_ACTIVE.store(false, Ordering::SeqCst);
                     }
                 } else {
                     let sil = silence_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
-                    // ~2 seconds of silence resets speech counter
-                    if sil > 100 {
-                        speech_frames_cb.store(0, Ordering::SeqCst);
+                    if sil > SILENCE_RESET_FRAMES {
+                        let old = speech_frames_cb.swap(0, Ordering::SeqCst);
+                        if old > 5 {
+                            log::debug!(
+                                "VAD wake: reset speech counter (was {} frames, RMS at reset={:.6})",
+                                old,
+                                rms
+                            );
+                        }
                     }
                 }
             },
@@ -285,6 +374,10 @@ fn spawn_vad_wake(app: AppHandle) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("VAD wake: stream build error: {}", e);
+                let _ = app_handle.emit(
+                    "wake:error",
+                    serde_json::json!({"error": format!("Stream build error: {}", e)}),
+                );
                 WAKE_ACTIVE.store(false, Ordering::SeqCst);
                 return;
             }
@@ -292,9 +385,24 @@ fn spawn_vad_wake(app: AppHandle) {
 
         if let Err(e) = stream.play() {
             log::error!("VAD wake: stream play error: {}", e);
+            let _ = app_handle.emit(
+                "wake:error",
+                serde_json::json!({"error": format!("Stream play error: {}", e)}),
+            );
             WAKE_ACTIVE.store(false, Ordering::SeqCst);
             return;
         }
+
+        // Emit RMS debug values periodically (every second)
+        let last_rms_ref = last_rms.clone();
+        std::thread::spawn(move || {
+            while WAKE_ACTIVE.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let raw = last_rms_ref.load(Ordering::Relaxed);
+                let rms = raw as f64 / 1_000_000.0;
+                log::debug!("VAD wake: current RMS={:.6} (threshold={})", rms, RMS_THRESHOLD);
+            }
+        });
 
         // Keep stream alive while active
         while WAKE_ACTIVE.load(Ordering::SeqCst) {
@@ -317,6 +425,7 @@ fn find_script_path(name: &str) -> std::path::PathBuf {
             .join("scripts")
             .join(name);
         if sibling.exists() {
+            log::info!("Found script at exe sibling: {:?}", sibling);
             return sibling;
         }
     }
@@ -327,6 +436,7 @@ fn find_script_path(name: &str) -> std::path::PathBuf {
     loop {
         let candidate = current.join("src-tauri").join("scripts").join(name);
         if candidate.exists() {
+            log::info!("Found script in project tree: {:?}", candidate);
             return candidate;
         }
         if !current.pop() {
@@ -335,5 +445,6 @@ fn find_script_path(name: &str) -> std::path::PathBuf {
     }
 
     // 3. Fallback
+    log::warn!("Script '{}' not found, using bare filename", name);
     std::path::PathBuf::from(name)
 }

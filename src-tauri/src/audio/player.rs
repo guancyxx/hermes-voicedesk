@@ -1,20 +1,18 @@
-/// TTS playback via macOS `say` command with JARVIS-like voice effects.
+/// TTS playback for Hermes VoiceDesk.
 ///
-/// Voice selection:
-/// - Default voice: `Daniel` (en_GB) — British male, closest to Paul Bettany's JARVIS.
-/// - Configurable via `set_voice()` / `set_jarvis_mode()`.
-///
-/// JARVIS audio post-processing (via ffmpeg):
-///   say -v <voice> -o raw.aiff  →  ffmpeg filters  →  afplay processed.aiff
-/// Filters: subtle pitch shift (-3%), dual-delay reverb for room presence,
-///          light EQ for clarity, compression for consistent volume.
-///
-/// Queue management:
-/// - Only ONE utterance runs at a time. Starting new speech kills the previous one.
-/// - A generation counter ensures stale TTS completion callbacks don't reset state.
+/// Voice providers (priority order):
+/// 1. **Edge-TTS** (`en-GB-RyanNeural`) — Best JARVIS-like British AI butler voice.
+///    Free Microsoft Edge TTS via `edge-tts` Python CLI. Requires internet.
+/// 2. **macOS say + ffmpeg** — Offline fallback. `say -v Daniel` with JARVIS
+///    audio post-processing via ffmpeg filters.
+/// 3. **macOS say direct** — Last resort, no dependencies.
 ///
 /// Echo prevention:
-/// - Mic is suspended BEFORE TTS begins, resumed after cooldown when TTS finishes.
+///   Mic is suspended BEFORE TTS begins, resumed after cooldown when TTS finishes.
+///
+/// Queue management:
+///   Only ONE utterance runs at a time. Starting new speech kills the previous one.
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -29,13 +27,88 @@ static TTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
-/// JARVIS mode: when enabled, audio goes through ffmpeg post-processing.
-static JARVIS_MODE: AtomicBool = AtomicBool::new(false);
+/// JARVIS mode: when enabled, TTS goes through the best available JARVIS voice pipeline.
+static JARVIS_MODE: AtomicBool = AtomicBool::new(true);
 
-/// Current macOS voice name (default: Daniel — British male, closest to JARVIS).
+/// Current macOS voice name (default: Daniel — British male, JARVIS-like fallback).
 static VOICE_NAME: Mutex<String> = Mutex::new(String::new());
 
-/// Get the configured voice name.
+/// Edge-TTS voice name for JARVIS mode.
+static EDGE_TTS_VOICE: Mutex<String> = Mutex::new(String::new());
+
+// ── Edge-TTS ─────────────────────────────────────────────────────────────────
+
+/// Edge-TTS binary paths to try (in order).
+const EDGE_TTS_PATHS: &[&str] = &[
+    "edge-tts",                                                     // In PATH
+    "/opt/homebrew/bin/edge-tts",                                   // Homebrew
+];
+
+/// Find the edge-tts binary, trying multiple paths and `python3 -m edge_tts`.
+fn find_edge_tts() -> Option<String> {
+    // 1. Try direct binary paths
+    for path in EDGE_TTS_PATHS {
+        if Command::new("which")
+            .arg(path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some(path.to_string());
+        }
+    }
+
+    // 2. Try user-local Python bin (macOS homebrew/standard pip)
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user_python_bins = [
+        format!("{}/Library/Python/3.9/bin/edge-tts", home),
+        format!("{}/Library/Python/3.10/bin/edge-tts", home),
+        format!("{}/Library/Python/3.11/bin/edge-tts", home),
+        format!("{}/Library/Python/3.12/bin/edge-tts", home),
+        format!("{}/Library/Python/3.13/bin/edge-tts", home),
+        format!("{}/.local/bin/edge-tts", home),
+    ];
+    for path in &user_python_bins {
+        if PathBuf::from(path).exists() {
+            return Some(path.clone());
+        }
+    }
+
+    // 3. Try `python3 -m edge_tts`
+    if Command::new("python3")
+        .args(["-c", "import edge_tts"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Some("python3 -m edge_tts".to_string());
+    }
+
+    None
+}
+
+/// Check if edge-tts is available.
+fn has_edge_tts() -> bool {
+    find_edge_tts().is_some()
+}
+
+/// Get the edge-tts command (binary path or python3 -m edge_tts).
+fn edge_tts_cmd() -> String {
+    find_edge_tts().unwrap_or_else(|| "edge-tts".to_string())
+}
+
+/// Get the configured edge-tts voice.
+fn get_edge_tts_voice() -> String {
+    let voice = EDGE_TTS_VOICE.lock().unwrap();
+    if voice.is_empty() {
+        "en-GB-RyanNeural".to_string()
+    } else {
+        voice.clone()
+    }
+}
+
+// ── Voice getter ─────────────────────────────────────────────────────────────
+
 fn get_voice() -> String {
     let voice = VOICE_NAME.lock().unwrap();
     if voice.is_empty() {
@@ -45,23 +118,23 @@ fn get_voice() -> String {
     }
 }
 
-/// JARVIS ffmpeg audio filter chain.
+// ── FFmpeg ───────────────────────────────────────────────────────────────────
+
+/// Enhanced JARVIS ffmpeg audio filter chain.
 ///
 /// Effect breakdown:
-/// - asetrate+atempo: pitch shift down ~3% without changing speed
-/// - aecho x 2: dual-tap reverb simulating medium room reflections
+/// - asetrate+atempo: pitch shift down 5% without changing speed (deeper, more butler-like)
+/// - aecho x 2: dual-tap reverb simulating a small room presence
 /// - highpass: remove sub-bass rumble
-/// - treble: slight clarity boost in presence range
+/// - lowpass: gentle high-end rolloff for warmth
 /// - compand: smooth dynamic range for broadcast-consistent levels
 const JARVIS_FILTER: &str = concat!(
-    "asetrate=44100*0.97,atempo=1/0.97,",
-    "aecho=0.8:0.7:30:0.25,aecho=0.8:0.7:60:0.15,",
-    "highpass=f=120,",
-    "treble=g=2:f=4000,",
-    "compand=attacks=0.005:decays=0.1:points=-80/-80|-30/-12|0/-3:gain=2"
+    "asetrate=44100*0.95,atempo=1/0.95,",
+    "aecho=0.8:0.7:20:0.3,aecho=0.8:0.6:50:0.2,",
+    "highpass=f=100,lowpass=f=8000,",
+    "compand=attacks=0.003:decays=0.1:points=-90/-90|-30/-15|0/-3:gain=3"
 );
 
-/// Check whether ffmpeg is available on the system.
 fn has_ffmpeg() -> bool {
     Command::new("which")
         .arg("ffmpeg")
@@ -70,7 +143,9 @@ fn has_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
-/// Enable or disable JARVIS-mode audio post-processing.
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Enable or disable JARVIS-mode TTS.
 pub fn set_jarvis_mode(enabled: bool) {
     JARVIS_MODE.store(enabled, Ordering::SeqCst);
 }
@@ -80,30 +155,45 @@ pub fn get_jarvis_mode() -> bool {
     JARVIS_MODE.load(Ordering::SeqCst)
 }
 
-/// Set the macOS voice to use for TTS (e.g., "Daniel", "Samantha").
+/// Set the macOS voice to use for TTS fallback (e.g., "Daniel", "Oliver").
 pub fn set_voice(name: &str) {
     *VOICE_NAME.lock().unwrap() = name.to_string();
 }
 
-/// Get current voice name.
+/// Get current macOS voice name.
 pub fn get_voice_name() -> String {
     get_voice()
 }
 
-/// Speak text using macOS `say` command with optional JARVIS post-processing.
+/// Set the Edge-TTS voice (e.g., "en-GB-RyanNeural", "en-GB-ThomasNeural").
+pub fn set_edge_tts_voice(name: &str) {
+    *EDGE_TTS_VOICE.lock().unwrap() = name.to_string();
+}
+
+/// Check if Edge-TTS is available on this system.
+pub fn has_jarvis_voice() -> bool {
+    has_edge_tts()
+}
+
+/// Get the current TTS provider description.
+pub fn get_tts_provider() -> &'static str {
+    if has_edge_tts() {
+        "Edge-TTS (en-GB-RyanNeural)"
+    } else if has_ffmpeg() {
+        "macOS say + ffmpeg JARVIS filter"
+    } else {
+        "macOS say (direct)"
+    }
+}
+
+// ── Core speak pipeline ──────────────────────────────────────────────────────
+
+/// Speak text using the best available TTS pipeline.
 ///
-/// Pipeline:
-/// 1. Kill any in-progress utterance
-/// 2. Bump generation counter
-/// 3. Suspend mic
-/// 4. Spawn background thread:
-///    a. `say -v <voice> -o raw.aiff <text>`
-///    b. If JARVIS mode + ffmpeg available: `ffmpeg -i raw.aiff -af <filter> processed.aiff`
-///    c. Play: `afplay <file>`
-///    d. Cleanup temp files, resume mic, emit events
-///
-/// When TTS finishes, emits `audio:state {state: "idle"}` so the frontend
-/// transitions to idle — user must explicitly click Listen again.
+/// Priority:
+/// 1. JARVIS mode + edge-tts available → Edge-TTS en-GB-RyanNeural
+/// 2. JARVIS mode + ffmpeg available → say + JARVIS ffmpeg filter
+/// 3. Normal mode → say direct (with optional JARVIS ffmpeg if enabled)
 pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     // 1. Kill previous utterance
     stop_child_process();
@@ -116,13 +206,19 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     capture::suspend_mic();
 
     let text_owned = text.to_string();
-    let voice = get_voice();
-    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst) && has_ffmpeg();
+    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
 
     std::thread::spawn(move || {
-        let result = if use_jarvis {
-            speak_with_jarvis(&text_owned, &voice)
+        let result = if use_jarvis && has_edge_tts() {
+            // Best: Edge-TTS with JARVIS voice
+            speak_with_edgetts(&text_owned)
+        } else if use_jarvis && has_ffmpeg() {
+            // Fallback: macOS say + ffmpeg JARVIS filters
+            let voice = get_voice();
+            speak_with_jarvis_ffmpeg(&text_owned, &voice)
         } else {
+            // Direct: macOS say (no processing)
+            let voice = get_voice();
             speak_direct(&text_owned, &voice)
         };
 
@@ -146,6 +242,79 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ── Edge-TTS pipeline ────────────────────────────────────────────────────────
+
+/// Speak using Edge-TTS for the best JARVIS-like British AI butler voice.
+///
+/// Pipeline:
+///   edge-tts --voice en-GB-RyanNeural --text "..." --write-media /tmp/tts.mp3
+///   → afplay /tmp/tts.mp3
+fn speak_with_edgetts(text: &str) -> Result<(), String> {
+    let pid = std::process::id();
+    let output_path = format!("/tmp/hermes_tts_edgetts_{}.mp3", pid);
+    let voice = get_edge_tts_voice();
+
+    // Edge-TTS supports --rate and --pitch for JARVIS-like adjustments
+    // Slightly slower rate (-5%) and lower pitch (-3Hz) for measured butler delivery
+    let cmd = edge_tts_cmd();
+
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let mut command = if parts.len() > 1 {
+        // python3 -m edge_tts
+        let mut c = Command::new(parts[0]);
+        c.args(&parts[1..]);
+        c
+    } else {
+        Command::new(&cmd)
+    };
+
+    let status = command
+        .arg("--voice")
+        .arg(&voice)
+        .arg("--rate=-5%")
+        .arg("--pitch=-3Hz")
+        .arg("--text")
+        .arg(text)
+        .arg("--write-media")
+        .arg(&output_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
+
+    if !status.success() {
+        // Edge-TTS failed — fall back to say + ffmpeg
+        log::warn!("Edge-TTS failed, falling back to macOS say + ffmpeg");
+        let voice = get_voice();
+        if has_ffmpeg() {
+            return speak_with_jarvis_ffmpeg(text, &voice);
+        } else {
+            return speak_direct(text, &voice);
+        }
+    }
+
+    // Play with afplay
+    let child = Command::new("afplay")
+        .arg(&output_path)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
+
+    *CURRENT_CHILD.lock().unwrap() = Some(child);
+
+    if let Some(mut child_to_wait) = CURRENT_CHILD.lock().unwrap().take() {
+        child_to_wait
+            .wait()
+            .map_err(|e| format!("afplay process error: {}", e))?;
+    }
+
+    // Clean up
+    let _ = std::fs::remove_file(&output_path);
+
+    Ok(())
+}
+
+// ── macOS say (direct) ───────────────────────────────────────────────────────
+
 /// Direct playback: `say -v <voice> <text>` (no post-processing).
 fn speak_direct(text: &str, voice: &str) -> Result<(), String> {
     let child = Command::new("say")
@@ -166,9 +335,10 @@ fn speak_direct(text: &str, voice: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── macOS say + ffmpeg JARVIS filter (fallback) ──────────────────────────────
+
 /// JARVIS pipeline: say → raw aiff → ffmpeg → processed aiff → afplay.
-fn speak_with_jarvis(text: &str, voice: &str) -> Result<(), String> {
-    // Use a temp file path unique to this process (PID-based)
+fn speak_with_jarvis_ffmpeg(text: &str, voice: &str) -> Result<(), String> {
     let pid = std::process::id();
     let raw_path = format!("/tmp/hermes_tts_raw_{}.aiff", pid);
     let processed_path = format!("/tmp/hermes_tts_jarvis_{}.aiff", pid);
@@ -189,7 +359,7 @@ fn speak_with_jarvis(text: &str, voice: &str) -> Result<(), String> {
 
     // Step 2: Apply JARVIS audio effects with ffmpeg
     let ffmpeg_status = Command::new("ffmpeg")
-        .arg("-y") // Overwrite output
+        .arg("-y")
         .arg("-i")
         .arg(&raw_path)
         .arg("-af")
@@ -204,9 +374,7 @@ fn speak_with_jarvis(text: &str, voice: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(&raw_path);
 
     if !ffmpeg_status.success() {
-        // Fall back to playing raw file if ffmpeg fails
-        log::warn!("ffmpeg processing failed, playing raw audio");
-        // Raw file is already deleted, just use say directly
+        log::warn!("ffmpeg processing failed, falling back to direct say");
         return speak_direct(text, voice);
     }
 
@@ -230,7 +398,9 @@ fn speak_with_jarvis(text: &str, voice: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Kill the currently-running child process (say, afplay, or ffmpeg).
+// ── Stop ─────────────────────────────────────────────────────────────────────
+
+/// Kill the currently-running child process (say, afplay, ffmpeg, or edge-tts).
 fn stop_child_process() {
     if let Some(mut child) = CURRENT_CHILD.lock().unwrap().take() {
         let _ = child.kill();
@@ -243,9 +413,10 @@ fn stop_child_process() {
 pub fn stop() -> Result<(), String> {
     stop_child_process();
 
-    // Safety net: kill any stray `say` or `afplay` processes
+    // Safety net: kill any stray `say`, `afplay`, or `edge-tts` processes
     let _ = Command::new("killall").arg("say").output();
     let _ = Command::new("killall").arg("afplay").output();
+    let _ = Command::new("killall").arg("edge-tts").output();
 
     // Resume mic immediately so the user can speak again
     capture::resume_mic();
