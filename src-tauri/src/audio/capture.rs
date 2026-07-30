@@ -6,6 +6,10 @@ use tauri::{AppHandle, Emitter};
 
 static IS_CAPTURING: AtomicBool = AtomicBool::new(false);
 
+/// When true, the mic callback returns immediately without processing any audio.
+/// Set during TTS playback to completely prevent echo capture.
+static MIC_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
 /// TTS playback counter. > 0 means TTS is currently playing.
 /// Using a counter instead of a bool prevents a stale TTS-end callback from
 /// resetting the state while a newer TTS utterance is still in progress.
@@ -18,12 +22,23 @@ static LAST_TTS_END_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Cooldown after TTS ends (milliseconds) during which speech detection
 /// is suppressed to avoid capturing TTS echo through the mic.
-const TTS_ECHO_COOLDOWN_MS: u64 = 800;
+const TTS_ECHO_COOLDOWN_MS: u64 = 1500;
 
 /// Module-level static so both start_mic_capture and stop_mic_capture share the same stream handle.
 /// Previously each function declared its own local static — stop_mic_capture was setting a
 /// *different* Option to None, so the real stream never dropped.
 static ACTIVE_STREAM: Mutex<Option<cpal::Stream>> = Mutex::new(None);
+
+/// Suspend the microphone callback entirely — no samples are processed, no events emitted.
+/// Used during TTS playback to completely prevent echo capture.
+pub fn suspend_mic() {
+    MIC_SUSPENDED.store(true, Ordering::SeqCst);
+}
+
+/// Resume the microphone callback — samples are processed again normally.
+pub fn resume_mic() {
+    MIC_SUSPENDED.store(false, Ordering::SeqCst);
+}
 
 /// Signal that TTS started — capture should pause speech detection.
 pub fn notify_tts_start() {
@@ -149,6 +164,12 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
             config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !IS_CAPTURING.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                // If mic is suspended (TTS playing), drop all samples immediately.
+                // No volume events, no RMS, no speech detection — complete silence to frontend.
+                if MIC_SUSPENDED.load(Ordering::SeqCst) {
                     return;
                 }
 

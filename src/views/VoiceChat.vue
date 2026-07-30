@@ -18,6 +18,77 @@ const isListening = ref(false)
 const volume = ref(0)
 const transcribedText = ref('')
 
+// --- Sentence-boundary streaming TTS ---
+const sentenceBuffer = ref('')
+const ttsQueue: string[] = []
+let isTtsActive = false
+let responseFinished = false
+
+// Regex for sentence-ending boundaries:
+//   。！？       — Chinese sentence enders
+//   \n\n        — paragraph break
+//   .!? followed by whitespace/end — English sentence enders
+const SENTENCE_END_RE = /([。！？]|\n\n|[.!?](?=\s|$))/
+
+/** Extract complete sentences from a text buffer. Returns the sentences found
+ *  and the remaining partial text (no sentence boundary at the end). */
+function extractSentences(text: string): { sentences: string[]; remainder: string } {
+  const sentences: string[] = []
+  let working = text
+  let lastEnd = 0
+
+  // Find all sentence boundaries using regex.exec in a loop
+  const re = new RegExp(SENTENCE_END_RE.source, 'g')
+  let match: RegExpExecArray | null
+
+  while ((match = re.exec(working)) !== null) {
+    const endIdx = match.index + match[0].length
+    const sentence = working.substring(lastEnd, endIdx).trim()
+    if (sentence) {
+      sentences.push(sentence)
+    }
+    lastEnd = endIdx
+    // Reset lastIndex for the substring-based approach
+    re.lastIndex = lastEnd
+  }
+
+  const remainder = working.substring(lastEnd)
+  return { sentences, remainder }
+}
+
+/** Enqueue a sentence for TTS. If nothing is currently speaking, starts the queue. */
+function enqueueSentence(sentence: string) {
+  const trimmed = sentence.trim()
+  if (!trimmed) return
+  ttsQueue.push(trimmed)
+  if (!isTtsActive) {
+    speakNextInQueue()
+  }
+}
+
+/** Speak the next sentence in the queue. Called when TTS is idle and queue has items. */
+function speakNextInQueue() {
+  if (ttsQueue.length === 0) {
+    isTtsActive = false
+    // If the full response has finished and the queue is drained, go back to listening
+    if (responseFinished && isListening.value) {
+      state.value = 'listening'
+    } else if (responseFinished) {
+      state.value = 'idle'
+    }
+    return
+  }
+
+  isTtsActive = true
+  state.value = 'speaking'
+  const sentence = ttsQueue.shift()!
+  invoke('speak_text', { text: sentence }).catch((e) => {
+    console.error('speak_text failed:', e)
+    // On error, skip to next sentence
+    speakNextInQueue()
+  })
+}
+
 let unlisteners: Array<() => void> = []
 
 onMounted(async () => {
@@ -45,8 +116,12 @@ onMounted(async () => {
       return
     }
 
-    // User is speaking — immediately stop any in-progress TTS
+    // User is speaking — immediately stop any in-progress TTS and clear queue
     invoke('stop_speaking').catch(() => {})
+    ttsQueue.length = 0
+    isTtsActive = false
+    sentenceBuffer.value = ''
+    responseFinished = false
 
     userText.value = text
     aiText.value = ''
@@ -61,9 +136,18 @@ onMounted(async () => {
     }
   })
 
+  // Streaming delta — accumulate and split on sentence boundaries
   const u4 = await listen<{ content: string }>('hermes:delta', (event) => {
     state.value = 'responding'
     aiText.value += event.payload.content
+    sentenceBuffer.value += event.payload.content
+
+    // Check for complete sentences
+    const { sentences, remainder } = extractSentences(sentenceBuffer.value)
+    for (const s of sentences) {
+      enqueueSentence(s)
+    }
+    sentenceBuffer.value = remainder
   })
 
   const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
@@ -74,25 +158,38 @@ onMounted(async () => {
   })
 
   const u6 = await listen('hermes:finish', () => {
-    state.value = 'speaking'
-    // Kill any previous TTS before starting new speech
-    invoke('stop_speaking').then(() => {
-      invoke('speak_text', { text: aiText.value })
-    })
-    // After TTS, go back to listening if still in voice mode
-    setTimeout(() => {
-      if (isListening.value && state.value === 'speaking') {
+    responseFinished = true
+
+    // Flush any remaining text in the buffer as a final sentence
+    if (sentenceBuffer.value.trim()) {
+      enqueueSentence(sentenceBuffer.value)
+      sentenceBuffer.value = ''
+    }
+
+    // If nothing is queued and nothing is speaking, go back to listening
+    if (ttsQueue.length === 0 && !isTtsActive) {
+      if (isListening.value) {
         state.value = 'listening'
+      } else {
+        state.value = 'idle'
       }
-    }, 1000)
+    }
+    // Otherwise the queue processor (tts:complete listener) will handle the transition
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
     state.value = 'idle'
     aiText.value += `\n\nError: ${event.payload.error}`
+    responseFinished = true
   })
 
-  unlisteners = [u1, u2, u3, u4, u5, u6, u7]
+  // TTS completion — fires after each sentence finishes speaking via macOS `say`
+  const u8 = await listen('tts:complete', () => {
+    // Speak the next sentence in the queue
+    speakNextInQueue()
+  })
+
+  unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8]
 })
 
 onUnmounted(() => {
@@ -107,6 +204,10 @@ async function toggleListening() {
   } else {
     aiText.value = ''
     toolCalls.value = []
+    sentenceBuffer.value = ''
+    ttsQueue.length = 0
+    isTtsActive = false
+    responseFinished = false
     await invoke('start_listening')
     isListening.value = true
   }
@@ -119,6 +220,10 @@ async function sendText() {
   userText.value = ''
   aiText.value = ''
   toolCalls.value = []
+  sentenceBuffer.value = ''
+  ttsQueue.length = 0
+  isTtsActive = false
+  responseFinished = false
   state.value = 'thinking'
 
   try {

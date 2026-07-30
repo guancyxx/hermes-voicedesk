@@ -39,8 +39,8 @@ async fn stop_listening() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn speak_text(text: String) -> Result<(), String> {
-    audio::player::speak(&text)
+fn speak_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
+    audio::player::speak(&text, app)
 }
 
 #[tauri::command]
