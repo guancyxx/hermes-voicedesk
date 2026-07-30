@@ -285,7 +285,22 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
 
     let path_str = path.to_string_lossy().to_string();
 
-    // ── Tier 1: faster-whisper (medium model) ──
+    // ── Tier 1: macOS SFSpeechRecognizer (Siri) — fast, on-device, no API key ──
+    match crate::stt::siri::transcribe_file(&path_str) {
+        Some(text) if !text.is_empty() => {
+            log::info!("STT (Siri): text={}", text);
+            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": 0.85, "engine": "siri" }));
+            return;
+        }
+        Some(_) => {
+            log::info!("STT (Siri): empty result, trying whisper fallback");
+        }
+        None => {
+            log::info!("STT (Siri): unavailable or failed, trying whisper fallback");
+        }
+    }
+
+    // ── Tier 2: faster-whisper (medium model) — offline fallback ──
     match transcribe_with_whisper(&path_str) {
         Some((text, confidence)) if confidence > 0.3 => {
             log::info!("STT (whisper): confidence={:.3} text={}", confidence, text);
@@ -293,29 +308,16 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
             return;
         }
         Some((text, confidence)) => {
-            // Whisper produced text but confidence is too low — still emit but note low confidence
-            log::warn!("STT (whisper): low confidence={:.3} text={}", confidence, text);
-            // Don't return — fall through to macOS native for a second opinion
+            log::warn!("STT (whisper): low confidence={:.3}, using as last resort", confidence);
+            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": confidence, "engine": "whisper" }));
+            return;
         }
         None => {
-            // Whisper failed entirely — fall through to macOS native
-            log::warn!("STT (whisper): failed, trying macOS native fallback");
+            log::warn!("STT: both Siri and whisper failed");
         }
     }
 
-    // ── Tier 2: macOS native SFSpeechRecognizer fallback ──
-    match transcribe_with_macos_native(&path_str) {
-        Some(text) => {
-            log::info!("STT (macOS native): text={}", text);
-            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": 0.8, "engine": "macos" }));
-        }
-        None => {
-            log::warn!("STT: both whisper and macOS native failed");
-            // If whisper gave us low-confidence text, use it as last resort
-            let fallback = "[no speech detected]".to_string();
-            let _ = app.emit("stt:result", serde_json::json!({ "text": fallback, "confidence": 0.0, "engine": "none" }));
-        }
-    }
+    let _ = app.emit("stt:result", serde_json::json!({ "text": "[no speech detected]", "confidence": 0.0, "engine": "none" }));
 }
 
 /// Returns (text, confidence) or None on failure.
@@ -394,81 +396,4 @@ except Exception as e:
             None
         }
     }
-}
-
-/// macOS native speech recognition via compiled Swift helper.
-/// Returns Some(text) on success, None on failure.
-fn transcribe_with_macos_native(path: &str) -> Option<String> {
-    // Locate the compiled helper binary.
-    // Priority: 1) next to the current executable, 2) in target dir, 3) PATH
-    let helper_name = "macos-stt-helper";
-    let helper_path = find_helper_binary(helper_name)?;
-
-    match std::process::Command::new(&helper_path)
-        .arg(path)
-        .output()
-    {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            if !stderr.is_empty() {
-                log::warn!("STT (macOS) stderr: {}", stderr);
-            }
-            if stdout.is_empty() || stdout == "[silence]" || stdout.starts_with("[macos_stt_error") {
-                log::warn!("STT (macOS): no transcription — {}", stdout);
-                None
-            } else {
-                Some(stdout)
-            }
-        }
-        Err(e) => {
-            log::error!("STT (macOS) helper failed: {}", e);
-            None
-        }
-    }
-}
-
-/// Find the compiled macos-stt-helper binary.
-fn find_helper_binary(name: &str) -> Option<std::path::PathBuf> {
-    // 1. Next to current executable (production — bundled in .app/Contents/MacOS/)
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(std::path::Path::new(".")).join(name);
-        if sibling.exists() {
-            log::debug!("Found helper at: {}", sibling.display());
-            return Some(sibling);
-        }
-    }
-
-    // 2. In target directory (development — cargo build output)
-    // Walk up from current dir to find target/
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        let candidate = current.join("target").join("release").join(name);
-        if candidate.exists() {
-            log::debug!("Found helper at: {}", candidate.display());
-            return Some(candidate);
-        }
-        let candidate_debug = current.join("target").join("debug").join(name);
-        if candidate_debug.exists() {
-            log::debug!("Found helper at: {}", candidate_debug.display());
-            return Some(candidate_debug);
-        }
-        if !current.pop() {
-            break;
-        }
-    }
-
-    // 3. Check PATH
-    if let Ok(paths) = std::env::var("PATH") {
-        for dir in paths.split(':') {
-            let candidate = std::path::Path::new(dir).join(name);
-            if candidate.exists() {
-                log::debug!("Found helper at: {}", candidate.display());
-                return Some(candidate);
-            }
-        }
-    }
-
-    log::warn!("Helper binary '{}' not found", name);
-    None
 }

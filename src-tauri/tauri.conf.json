@@ -46,6 +46,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "../target/release/macos-stt-helper"
+    ],
     "createUpdaterArtifacts": false,
     "category": "Productivity",
     "shortDescription": "Real-time voice AI desktop assistant",
