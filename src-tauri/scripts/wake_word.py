@@ -6,12 +6,12 @@ Listens for a built-in wake word and prints JSON events to stdout.
 Designed to run as a subprocess controlled by Hermes VoiceDesk.
 
 Usage:
-    python3 wake_word.py --keyword picovoice
+    python3 wake_word.py --keyword jarvis
     python3 wake_word.py --keyword "hey siri"
 
 Output (stdout, one line per event):
-    {"event": "ready", "keyword": "picovoice", "sample_rate": 16000}
-    {"event": "wake_word", "keyword": "picovoice", "index": 0}
+    {"event": "ready", "keyword": "jarvis", "sample_rate": 16000}
+    {"event": "wake_word", "keyword": "jarvis", "index": 0}
     {"event": "stopped"}
 
 Stop: send SIGTERM, or write "stop\n" to stdin.
@@ -51,7 +51,7 @@ def main():
     parser = argparse.ArgumentParser(description="Porcupine Wake Word Detector")
     parser.add_argument(
         "--keyword",
-        default="picovoice",
+        default="jarvis",
         choices=list(pvporcupine.KEYWORDS),
         help="Wake word to detect",
     )

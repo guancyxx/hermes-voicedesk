@@ -151,7 +151,7 @@ function enterWakeMode() {
   // Start wake word detection
   invoke('start_wake_word', {
     accessKey: null,
-    keyword: 'picovoice',
+    keyword: 'jarvis',
   }).catch((e) => console.error('start_wake_word failed:', e))
 
   state.value = 'waiting'

@@ -25,7 +25,7 @@ pub fn start_wake_word(app: AppHandle, access_key: Option<String>, keyword: Opti
     WAKE_ACTIVE.store(true, Ordering::SeqCst);
     WAKE_WORD_DETECTED.store(false, Ordering::SeqCst);
 
-    let kw = keyword.unwrap_or_else(|| "picovoice".to_string());
+    let kw = keyword.unwrap_or_else(|| "jarvis".to_string());
 
     if let Some(key) = access_key {
         if !key.is_empty() {
@@ -148,7 +148,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                                 let detected = event
                                     .get("keyword")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("picovoice");
+                                    .unwrap_or("jarvis");
                                 log::info!("Wake word detected: {}", detected);
                                 WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
                                 let _ = app_handle.emit(
