@@ -37,7 +37,7 @@ function startCycle() {
   if (displayList.value.length <= 1) return
   timer = setInterval(() => {
     currentIndex.value = (currentIndex.value + 1) % displayList.value.length
-  }, 2000)
+  }, 3000)
 }
 
 function stopCycle() {

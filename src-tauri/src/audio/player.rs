@@ -30,7 +30,7 @@ static TTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 /// JARVIS mode: when enabled, audio goes through ffmpeg post-processing.
-static JARVIS_MODE: AtomicBool = AtomicBool::new(true);
+static JARVIS_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Current macOS voice name (default: Daniel — British male, closest to JARVIS).
 static VOICE_NAME: Mutex<String> = Mutex::new(String::new());
