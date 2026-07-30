@@ -7,6 +7,8 @@ import Transcription from '../components/Transcription.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import StateIndicator from '../components/StateIndicator.vue'
 import DebugPanel from '../components/DebugPanel.vue'
+import ToolCarousel from '../components/ToolCarousel.vue'
+import type { ToolCall } from '../components/ToolCarousel.vue'
 import type { DebugEntry } from '../components/DebugPanel.vue'
 
 type VoiceState = 'idle' | 'waiting' | 'listening' | 'transcribing' | 'thinking' | 'responding' | 'speaking'
@@ -19,6 +21,7 @@ interface Message {
 const state = ref<VoiceState>('waiting')
 const userText = ref('')
 const messages = ref<Message[]>([])
+const toolCalls = ref<ToolCall[]>([])
 const apiConnected = ref(false)
 const isListening = ref(false)
 const volume = ref(0)
@@ -231,6 +234,9 @@ onMounted(async () => {
       return
     }
 
+    // Clear tool calls for new conversation round
+    toolCalls.value = []
+
     // Stop any in-progress TTS
     invoke('stop_speaking').catch(() => {})
     ttsQueue.length = 0
@@ -285,11 +291,30 @@ onMounted(async () => {
   })
 
   const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
-    addDebugEntry('info', 'API', `Tool: ${event.payload.tool}`, `status=${event.payload.status}`)
+    const { tool, status } = event.payload
+    addDebugEntry('info', 'API', `Tool: ${tool}`, `status=${status}`)
+
+    // Track tool calls for carousel display
+    if (status === 'started') {
+      toolCalls.value.push({ tool, status: 'started' })
+    } else {
+      const existing = toolCalls.value.find(t => t.tool === tool && t.status === 'started')
+      if (existing) {
+        existing.status = status === 'error' ? 'error' : 'completed'
+      } else {
+        toolCalls.value.push({ tool, status: status === 'error' ? 'error' : 'completed' })
+      }
+    }
   })
 
   const u6 = await listen('hermes:finish', () => {
     responseFinished = true
+    // Mark all active tools as completed
+    for (const tc of toolCalls.value) {
+      if (tc.status === 'started') {
+        tc.status = 'completed'
+      }
+    }
     addDebugEntry('success', 'API', 'Stream finished', `Total AI message length: ${messages.value[messages.value.length - 1]?.text.length || 0}`)
 
     // Flush any remaining text in the buffer
@@ -388,6 +413,7 @@ async function sendText() {
   ttsQueue.length = 0
   isTtsActive = false
   responseFinished = false
+  toolCalls.value = []
   isProcessing = true
   state.value = 'thinking'
   addDebugEntry('info', 'API', '→ hermes_chat_stream (text)', `message="${text}"`)
@@ -467,6 +493,11 @@ async function toggleWake() {
         :key="i"
         :role="msg.role"
         :text="msg.text"
+      />
+
+      <ToolCarousel
+        v-if="(state === 'thinking' || state === 'responding') && toolCalls.length > 0"
+        :tool-calls="toolCalls"
       />
 
       <div v-if="state === 'thinking' || state === 'transcribing'" class="thinking-indicator">
