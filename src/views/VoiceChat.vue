@@ -133,6 +133,12 @@ function scrollToBottom() {
   nextTick(() => {
     if (chatArea.value) {
       chatArea.value.scrollTop = chatArea.value.scrollHeight
+      // Double-check after browser layout to handle dynamic content
+      requestAnimationFrame(() => {
+        if (chatArea.value) {
+          chatArea.value.scrollTop = chatArea.value.scrollHeight
+        }
+      })
     }
   })
 }
