@@ -67,6 +67,9 @@ let isTtsActive = false
 let isProcessing = false
 let responseFinished = false
 
+// Hidden buffer that accumulates ALL deltas (full response text for history save)
+const fullResponseText = ref('')
+
 // Regex for sentence-ending boundaries
 const SENTENCE_END_RE = /([。！？]|\n\n|[.!?](?=\s|$))/
 
@@ -113,6 +116,13 @@ function speakNextInQueue() {
   isTtsActive = true
   state.value = 'speaking'
   const sentence = ttsQueue.shift()!
+
+  // Reveal sentence in chat bubble AS TTS starts (text appears with audio)
+  if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
+    messages.value[messages.value.length - 1].text += sentence
+  }
+  scrollToBottom()
+
   invoke('speak_text', { text: sentence }).catch((e) => {
     console.error('speak_text failed:', e)
     speakNextInQueue()
@@ -242,6 +252,7 @@ onMounted(async () => {
     ttsQueue.length = 0
     isTtsActive = false
     sentenceBuffer.value = ''
+    fullResponseText.value = ''
     responseFinished = false
 
     // Add user message to chat history
@@ -270,14 +281,13 @@ onMounted(async () => {
     }
   })
 
-  // Streaming delta — accumulate into the last AI message
+  // Streaming delta — accumulate into hidden buffer, do NOT reveal in chat yet.
+  // Sentences appear in the chat bubble from speakNextInQueue() when TTS starts playing them.
   const u4 = await listen<{ content: string }>('hermes:delta', (event) => {
     state.value = 'responding'
 
-    // Update the last AI message in the array
-    if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
-      messages.value[messages.value.length - 1].text += event.payload.content
-    }
+    // Accumulate into the hidden full-response buffer (used for history save)
+    fullResponseText.value += event.payload.content
 
     addDebugEntry('info', 'API', `Delta: +${event.payload.content.length} chars`, event.payload.content.length > 100 ? event.payload.content.slice(0, 100) + '...' : event.payload.content)
 
@@ -287,7 +297,7 @@ onMounted(async () => {
       enqueueSentence(s)
     }
     sentenceBuffer.value = remainder
-    scrollToBottom()
+    // NO scrollToBottom here — scroll happens when sentences are revealed in speakNextInQueue()
   })
 
   const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
@@ -315,7 +325,7 @@ onMounted(async () => {
         tc.status = 'completed'
       }
     }
-    addDebugEntry('success', 'API', 'Stream finished', `Total AI message length: ${messages.value[messages.value.length - 1]?.text.length || 0}`)
+    addDebugEntry('success', 'API', 'Stream finished', `Total AI message length: ${fullResponseText.value.length}`)
 
     // Flush any remaining text in the buffer
     if (sentenceBuffer.value.trim()) {
@@ -323,7 +333,7 @@ onMounted(async () => {
       sentenceBuffer.value = ''
     }
 
-    // Save this turn to history
+    // Save this turn to history using the full response text
     const msgs = messages.value
     if (msgs.length >= 2) {
       const lastAi = msgs[msgs.length - 1]
@@ -332,7 +342,7 @@ onMounted(async () => {
         invoke('save_chat_history', {
           sessionId: sessionId.value,
           userText: lastUser.text,
-          aiText: lastAi.text,
+          aiText: fullResponseText.value,
         }).catch((e) => console.error('Failed to save chat history:', e))
       }
     }
@@ -353,7 +363,9 @@ onMounted(async () => {
     enterWakeMode()
   })
 
-  // TTS completion
+  // TTS completion — next sentence can start now
+  // Sentence was already revealed in speakNextInQueue() when TTS started.
+  // Just advance the queue so the next sentence plays when ready.
   const u8 = await listen('tts:complete', () => {
     addDebugEntry('info', 'TTS', 'TTS sentence complete')
     speakNextInQueue()
@@ -374,6 +386,7 @@ async function startListening() {
   console.log('[VoiceChat] startListening')
   addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   sentenceBuffer.value = ''
+  fullResponseText.value = ''
   ttsQueue.length = 0
   isTtsActive = false
   isProcessing = false
@@ -410,6 +423,7 @@ async function sendText() {
   scrollToBottom()
 
   sentenceBuffer.value = ''
+  fullResponseText.value = ''
   ttsQueue.length = 0
   isTtsActive = false
   responseFinished = false

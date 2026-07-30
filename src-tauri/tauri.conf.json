@@ -47,7 +47,8 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "../target/release/macos-stt-helper"
+      "../target/release/macos-stt-helper",
+      "resources/jarvis-persona.md"
     ],
     "createUpdaterArtifacts": false,
     "category": "Productivity",

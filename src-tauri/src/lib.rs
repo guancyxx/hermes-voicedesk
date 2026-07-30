@@ -3,11 +3,18 @@ mod stt;
 mod api;
 mod session;
 
+use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+
+/// Embedded JARVIS persona system prompt
+const JARVIS_PERSONA: &str = include_str!("../resources/jarvis-persona.md");
+
+/// Tracks whether JARVIS persona is active
+static JARVIS_ACTIVE: Mutex<bool> = Mutex::new(false);
 
 #[tauri::command]
 async fn hermes_chat(message: String, session_id: Option<String>) -> Result<String, String> {
@@ -57,6 +64,108 @@ fn speak_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn stop_speaking() -> Result<(), String> {
     audio::player::stop()
+}
+
+#[tauri::command]
+fn set_jarvis_mode(enabled: bool) -> Result<(), String> {
+    audio::player::set_jarvis_mode(enabled);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_jarvis_mode() -> Result<bool, String> {
+    Ok(audio::player::get_jarvis_mode())
+}
+
+#[tauri::command]
+fn set_voice(voice: String) -> Result<(), String> {
+    audio::player::set_voice(&voice);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_voice() -> Result<String, String> {
+    Ok(audio::player::get_voice_name())
+}
+
+/// Load the JARVIS persona system prompt.
+/// Returns the full persona text. When `activate` is true, sends the persona
+/// to Hermes Agent as a system message to set up the JARVIS personality.
+#[tauri::command]
+async fn load_jarvis_persona(activate: bool) -> Result<String, String> {
+    let persona = JARVIS_PERSONA.to_string();
+
+    if activate {
+        // Set JARVIS as active
+        *JARVIS_ACTIVE.lock().unwrap() = true;
+        // Enable JARVIS voice mode
+        audio::player::set_jarvis_mode(true);
+
+        // Send the persona as a system prompt to Hermes
+        let setup_message = format!(
+            "[SYSTEM INSTRUCTION - JARVIS PERSONA ACTIVATED]\n\n{}\n\n---\n从现在开始，你将以 JARVIS 的身份和语气回复。确认激活。",
+            persona
+        );
+
+        match api::hermes::chat(&setup_message, None).await {
+            Ok(response) => {
+                log::info!("JARVIS persona activated: {}", &response[..response.len().min(120)]);
+            }
+            Err(e) => {
+                log::warn!("Failed to activate JARVIS persona on Hermes API: {}", e);
+                // Still return the persona, frontend can retry
+            }
+        }
+    }
+
+    Ok(persona)
+}
+
+/// Check if JARVIS persona is currently active.
+#[tauri::command]
+fn is_jarvis_persona_active() -> Result<bool, String> {
+    Ok(*JARVIS_ACTIVE.lock().unwrap())
+}
+
+/// Deactivate JARVIS persona and reset to default mode.
+#[tauri::command]
+async fn deactivate_jarvis_persona() -> Result<(), String> {
+    *JARVIS_ACTIVE.lock().unwrap() = false;
+    audio::player::set_jarvis_mode(false);
+
+    // Send a reset message to Hermes
+    let reset_msg = "[SYSTEM INSTRUCTION - JARVIS PERSONA DEACTIVATED]\n\n请恢复到默认的 Hermes Agent 人格。确认解除 JARVIS 模式。";
+    match api::hermes::chat(reset_msg, None).await {
+        Ok(_) => log::info!("JARVIS persona deactivated"),
+        Err(e) => log::warn!("Failed to deactivate JARVIS persona on Hermes API: {}", e),
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_available_voices() -> Result<Vec<String>, String> {
+    use std::process::Command;
+    let output = Command::new("say")
+        .arg("-v")
+        .arg("?")
+        .output()
+        .map_err(|e| format!("Failed to list voices: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let voices: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                Some(parts[0].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(voices)
 }
 
 #[tauri::command]
@@ -178,6 +287,14 @@ pub fn run() {
             get_wake_status,
             transcribe_audio,
             transcribe_audio_native,
+            set_jarvis_mode,
+            get_jarvis_mode,
+            set_voice,
+            get_voice,
+            get_available_voices,
+            load_jarvis_persona,
+            is_jarvis_persona_active,
+            deactivate_jarvis_persona,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes VoiceDesk");
