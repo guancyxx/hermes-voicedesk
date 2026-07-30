@@ -286,10 +286,10 @@ fn spawn_vad_wake(app: AppHandle) {
         let app_cb = app_handle.clone();
 
         // VAD parameters (tuned for reliable speech detection)
-        // RMS threshold: 0.005 is sensitive enough for normal speech at arm's length
-        const RMS_THRESHOLD: f64 = 0.005;
-        // Frames of sustained speech needed to trigger (~1.0s at 30ms frames)
-        const TRIGGER_FRAMES: u32 = 33;
+        // RMS threshold: 0.003 is sensitive enough for normal speech at arm's length
+        const RMS_THRESHOLD: f64 = 0.003;
+        // Frames of sustained speech needed to trigger (~0.6s at 30ms frames)
+        const TRIGGER_FRAMES: u32 = 20;
         // Silence frames needed to reset the counter (~1.5s)
         const SILENCE_RESET_FRAMES: u32 = 50;
 
