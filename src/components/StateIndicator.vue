@@ -10,6 +10,7 @@ const stateLabels: Record<string, string> = {
   idle: 'Ready',
   waiting: 'Waiting...',
   listening: 'Listening...',
+  transcribing: 'Transcribing...',
   thinking: 'Thinking...',
   responding: 'Responding...',
   speaking: 'Speaking...',
@@ -56,6 +57,7 @@ const stateLabels: Record<string, string> = {
 .state-pill.waiting .state-dot { background: #6c5ce7; animation: wake-pulse 2s infinite; }
 .state-pill.listening .state-dot { background: #6c5ce7; animation: pulse 1s infinite; }
 .state-pill.thinking .state-dot { background: #f39c12; animation: pulse 1s infinite; }
+.state-pill.transcribing .state-dot { background: #e67e22; animation: pulse 1s infinite; }
 .state-pill.responding .state-dot { background: #3498db; }
 .state-pill.speaking .state-dot { background: #2ecc71; }
 

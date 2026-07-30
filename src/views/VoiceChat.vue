@@ -7,7 +7,7 @@ import Transcription from '../components/Transcription.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import StateIndicator from '../components/StateIndicator.vue'
 
-type VoiceState = 'idle' | 'waiting' | 'listening' | 'thinking' | 'responding' | 'speaking'
+type VoiceState = 'idle' | 'waiting' | 'listening' | 'transcribing' | 'thinking' | 'responding' | 'speaking'
 
 interface Message {
   role: 'user' | 'ai'
@@ -394,17 +394,17 @@ async function toggleWake() {
         :text="msg.text"
       />
 
-      <div v-if="state === 'thinking'" class="thinking-indicator">
+      <div v-if="state === 'thinking' || state === 'transcribing'" class="thinking-indicator">
         <span class="dot"></span>
         <span class="dot"></span>
         <span class="dot"></span>
-        <span class="thinking-text">Thinking...</span>
+        <span class="thinking-text">{{ state === 'transcribing' ? 'Transcribing...' : 'Thinking...' }}</span>
       </div>
     </div>
 
     <Transcription
       :text="userText"
-      :placeholder="state === 'listening' ? 'Listening...' : state === 'waiting' ? 'Say wake word or type...' : state === 'thinking' ? transcribedText || 'Processing...' : 'Type or speak...'"
+      :placeholder="state === 'listening' ? 'Listening...' : state === 'waiting' ? 'Say wake word or type...' : state === 'transcribing' ? 'Transcribing speech...' : state === 'thinking' ? transcribedText || 'Processing...' : 'Type or speak...'"
       @update:text="userText = $event"
       @send="sendText"
     />

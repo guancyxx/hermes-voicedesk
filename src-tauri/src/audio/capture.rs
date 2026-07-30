@@ -208,7 +208,7 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                         let sr = det.sample_rate;
                         let app = app_handle.clone();
                         std::thread::spawn(move || {
-                            let _ = app.emit("audio:state", serde_json::json!({ "state": "thinking" }));
+                            let _ = app.emit("audio:state", serde_json::json!({ "state": "transcribing" }));
                             save_and_transcribe(&audio_data, sr, app);
                         });
                     }
