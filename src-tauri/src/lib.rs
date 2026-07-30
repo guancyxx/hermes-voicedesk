@@ -39,6 +39,17 @@ async fn stop_listening() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn save_chat_history(session_id: String, user_text: String, ai_text: String) -> Result<(), String> {
+    let turn = session::store::new_turn(&session_id, &user_text, &ai_text);
+    session::store::save_turn(&turn)
+}
+
+#[tauri::command]
+fn load_chat_history(session_id: String) -> Result<Vec<session::store::ConversationTurn>, String> {
+    session::store::load_history(&session_id)
+}
+
+#[tauri::command]
 fn speak_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
     audio::player::speak(&text, app)
 }
@@ -135,6 +146,8 @@ pub fn run() {
             check_hermes_api,
             start_listening,
             stop_listening,
+            save_chat_history,
+            load_chat_history,
             speak_text,
             stop_speaking,
             notify_tts_start,
