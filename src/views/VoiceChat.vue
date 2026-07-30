@@ -6,6 +6,8 @@ import AudioWave from '../components/AudioWave.vue'
 import Transcription from '../components/Transcription.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import StateIndicator from '../components/StateIndicator.vue'
+import DebugPanel from '../components/DebugPanel.vue'
+import type { DebugEntry } from '../components/DebugPanel.vue'
 
 type VoiceState = 'idle' | 'waiting' | 'listening' | 'transcribing' | 'thinking' | 'responding' | 'speaking'
 
@@ -30,6 +32,30 @@ const sessionId = ref(`voice-${new Date().toISOString().slice(0, 10)}`)
 
 // Chat area ref for scroll-to-bottom
 const chatArea = ref<HTMLElement | null>(null)
+
+// Debug log panel
+const debugVisible = ref(false)
+const debugLog = ref<DebugEntry[]>([])
+
+function addDebugEntry(
+  type: DebugEntry['type'],
+  category: string,
+  message: string,
+  detail?: string
+) {
+  const now = new Date()
+  const timestamp = now.toLocaleTimeString('en-US', {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }) + '.' + String(now.getMilliseconds()).padStart(3, '0')
+  debugLog.value.push({ timestamp, type, category, message, detail })
+}
+
+function clearDebugLog() {
+  debugLog.value = []
+}
 
 // --- Sentence-boundary streaming TTS ---
 const sentenceBuffer = ref('')
@@ -100,6 +126,7 @@ function scrollToBottom() {
 
 function enterWakeMode() {
   console.log(`[VoiceChat] enterWakeMode (wakeEnabled=${wakeEnabled.value})`)
+  addDebugEntry('info', 'STATE', '→ waiting (wake)', `wakeEnabled=${wakeEnabled.value}`)
   if (!wakeEnabled.value) {
     state.value = 'idle'
     return
@@ -138,17 +165,21 @@ onMounted(async () => {
 
   try {
     apiConnected.value = await invoke('check_hermes_api')
+    addDebugEntry('success', 'SYSTEM', 'Hermes API connected')
   } catch (e) {
     apiConnected.value = false
     console.error('Hermes API check failed:', e)
+    addDebugEntry('error', 'SYSTEM', 'Hermes API unreachable', String(e))
   }
 
   const u1 = await listen<{ state: VoiceState }>('audio:state', (event) => {
     if (!isTtsActive && !isProcessing) {
       console.log(`[VoiceChat] audio:state → ${event.payload.state} (applied)`)
       state.value = event.payload.state
+      addDebugEntry('info', 'STATE', `→ ${event.payload.state}`)
     } else {
       console.log(`[VoiceChat] audio:state → ${event.payload.state} (ignored: isTtsActive=${isTtsActive}, isProcessing=${isProcessing})`)
+      addDebugEntry('warning', 'STATE', `${event.payload.state} (ignored)`, `TTS active or processing`)
     }
   })
 
@@ -163,12 +194,14 @@ onMounted(async () => {
       wakeMode.value = event.payload.mode as 'vad' | 'porcupine'
       wakeKeyword.value = event.payload.keyword
       state.value = 'waiting'
+      addDebugEntry('info', 'WAKE', `Wake mode: ${event.payload.mode}`, `keyword="${event.payload.keyword}"`)
     }
   )
 
   const u10 = await listen<{ keyword: string; mode?: string }>(
     'wake:detected',
     async () => {
+      addDebugEntry('success', 'WAKE', 'Wake word detected!', 'Starting listening...')
       // Wake word detected! Stop wake word and start listening.
       invoke('stop_wake_word').catch(() => {})
       // Small delay for clean transition
@@ -179,6 +212,7 @@ onMounted(async () => {
 
   const u11 = await listen<{ error: string }>('wake:error', (event) => {
     console.error('Wake word error:', event.payload.error)
+    addDebugEntry('error', 'WAKE', 'Wake error', event.payload.error)
     // Fall back to idle so user can manually listen
     state.value = 'idle'
   })
@@ -187,8 +221,10 @@ onMounted(async () => {
   const u3 = await listen<{ text: string }>('stt:result', async (event) => {
     const text = event.payload.text
     console.log(`[VoiceChat] stt:result text="${text}"`)
+    addDebugEntry('success', 'STT', `Transcribed`, `text="${text}"`)
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
+      addDebugEntry('warning', 'STT', 'Empty or failed transcription', `raw="${text}"`)
       messages.value.push({ role: 'ai', text: "Sorry, I didn't catch that." })
       scrollToBottom()
       state.value = 'idle'
@@ -211,6 +247,7 @@ onMounted(async () => {
     console.log(`[VoiceChat] → hermes_chat_stream: "${text}"`)
     isProcessing = true
     state.value = 'thinking'
+    addDebugEntry('info', 'API', '→ hermes_chat_stream', `message="${text}"`)
 
     try {
       await invoke('hermes_chat_stream', { message: text })
@@ -219,6 +256,7 @@ onMounted(async () => {
       isProcessing = false
       state.value = 'idle'
       console.error(`[VoiceChat] hermes_chat_stream error:`, e)
+      addDebugEntry('error', 'API', 'hermes_chat_stream failed', String(e))
       const lastMsg = messages.value[messages.value.length - 1]
       if (lastMsg && lastMsg.role === 'ai') {
         lastMsg.text = `Error: ${e}`
@@ -235,6 +273,8 @@ onMounted(async () => {
       messages.value[messages.value.length - 1].text += event.payload.content
     }
 
+    addDebugEntry('info', 'API', `Delta: +${event.payload.content.length} chars`, event.payload.content.length > 100 ? event.payload.content.slice(0, 100) + '...' : event.payload.content)
+
     sentenceBuffer.value += event.payload.content
     const { sentences, remainder } = extractSentences(sentenceBuffer.value)
     for (const s of sentences) {
@@ -244,12 +284,13 @@ onMounted(async () => {
     scrollToBottom()
   })
 
-  const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (_event) => {
-    // Tool calls are shown inline via delta stream; no separate display needed
+  const u5 = await listen<{ tool: string; status: string }>('hermes:tool', (event) => {
+    addDebugEntry('info', 'API', `Tool: ${event.payload.tool}`, `status=${event.payload.status}`)
   })
 
   const u6 = await listen('hermes:finish', () => {
     responseFinished = true
+    addDebugEntry('success', 'API', 'Stream finished', `Total AI message length: ${messages.value[messages.value.length - 1]?.text.length || 0}`)
 
     // Flush any remaining text in the buffer
     if (sentenceBuffer.value.trim()) {
@@ -278,6 +319,7 @@ onMounted(async () => {
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
+    addDebugEntry('error', 'API', 'Hermes error', event.payload.error)
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
       lastMsg.text += `\n\nError: ${event.payload.error}`
@@ -288,6 +330,7 @@ onMounted(async () => {
 
   // TTS completion
   const u8 = await listen('tts:complete', () => {
+    addDebugEntry('info', 'TTS', 'TTS sentence complete')
     speakNextInQueue()
   })
 
@@ -304,6 +347,7 @@ onUnmounted(() => {
 
 async function startListening() {
   console.log('[VoiceChat] startListening')
+  addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   sentenceBuffer.value = ''
   ttsQueue.length = 0
   isTtsActive = false
@@ -346,12 +390,14 @@ async function sendText() {
   responseFinished = false
   isProcessing = true
   state.value = 'thinking'
+  addDebugEntry('info', 'API', '→ hermes_chat_stream (text)', `message="${text}"`)
 
   try {
     await invoke('hermes_chat_stream', { message: text })
     isProcessing = false
   } catch (e) {
     isProcessing = false
+    addDebugEntry('error', 'API', 'hermes_chat_stream failed (text)', String(e))
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
       lastMsg.text = `Error: ${e}`
@@ -362,6 +408,7 @@ async function sendText() {
 
 async function toggleWake() {
   wakeEnabled.value = !wakeEnabled.value
+  addDebugEntry('info', 'SYSTEM', `Wake word ${wakeEnabled.value ? 'enabled' : 'disabled'}`)
   if (!wakeEnabled.value) {
     await invoke('stop_wake_word')
     await invoke('stop_listening')
@@ -378,6 +425,14 @@ async function toggleWake() {
     <header class="chat-header">
       <StateIndicator :state="state" :api-connected="apiConnected" :wake-mode="wakeMode" :wake-keyword="wakeKeyword" />
       <div class="header-buttons">
+        <button
+          class="btn-debug"
+          :class="{ active: debugVisible }"
+          @click="debugVisible = !debugVisible"
+          title="Toggle Debug Panel"
+        >
+          🐛
+        </button>
         <button
           class="btn-wake"
           :class="{ active: wakeEnabled }"
@@ -436,6 +491,13 @@ async function toggleWake() {
       </span>
       <span v-if="isListening" class="mic-level">| Mic: {{ (volume * 100).toFixed(0) }}%</span>
     </footer>
+
+    <DebugPanel
+      :entries="debugLog"
+      :visible="debugVisible"
+      @close="debugVisible = false"
+      @clear="clearDebugLog"
+    />
   </div>
 </template>
 
@@ -447,6 +509,7 @@ async function toggleWake() {
   background: #1a1a2e;
   color: #e0e0e0;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
+  position: relative;
 }
 
 .chat-header {
@@ -503,6 +566,26 @@ async function toggleWake() {
 }
 
 .btn-wake:hover {
+  opacity: 0.9;
+}
+
+.btn-debug {
+  padding: 6px 10px;
+  border-radius: 20px;
+  border: 1px solid #4a4a8a;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+  line-height: 1;
+}
+
+.btn-debug.active {
+  border-color: #e5c07b;
+  background: rgba(229, 192, 123, 0.15);
+}
+
+.btn-debug:hover {
   opacity: 0.9;
 }
 
