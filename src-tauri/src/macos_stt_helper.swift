@@ -53,13 +53,11 @@ let request = SFSpeechURLRecognitionRequest(url: audioURL)
 request.requiresOnDeviceRecognition = false
 request.shouldReportPartialResults = false
 
-let group = DispatchGroup()
-group.enter()
-
 var transcription: String?
 var recognitionError: Error?
+var finished = false
 
-recognizer.recognitionTask(with: request) { result, error in
+let task = recognizer.recognitionTask(with: request) { result, error in
     if let error = error {
         recognitionError = error
     }
@@ -67,13 +65,21 @@ recognizer.recognitionTask(with: request) { result, error in
         transcription = result.bestTranscription.formattedString
     }
     if result?.isFinal == true || error != nil {
-        group.leave()
+        finished = true
+        CFRunLoopStop(CFRunLoopGetMain())
     }
 }
 
-// Wait up to 15 seconds for recognition
-let timeout = DispatchTime.now() + .seconds(15)
-if group.wait(timeout: timeout) == .timedOut {
+// Run the main run loop until done or timeout — DispatchSemaphore.wait()
+// blocks the thread and prevents SFSpeechRecognizer callbacks from being
+// dispatched on macOS 26+ where callbacks are delivered via the run loop.
+let deadline = Date().addingTimeInterval(15)
+while !finished && Date() < deadline {
+    RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+}
+
+if !finished {
+    task.cancel()
     fputs("[macos_stt_error: recognition timed out]\n", stderr)
     exit(1)
 }

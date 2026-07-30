@@ -422,7 +422,8 @@ async function toggleWake() {
 
 <template>
   <div class="voice-chat">
-    <header class="chat-header">
+    <div class="main-content">
+      <header class="chat-header">
       <StateIndicator :state="state" :api-connected="apiConnected" :wake-mode="wakeMode" :wake-keyword="wakeKeyword" />
       <div class="header-buttons">
         <button
@@ -491,6 +492,7 @@ async function toggleWake() {
       </span>
       <span v-if="isListening" class="mic-level">| Mic: {{ (volume * 100).toFixed(0) }}%</span>
     </footer>
+    </div>
 
     <DebugPanel
       :entries="debugLog"
@@ -504,12 +506,20 @@ async function toggleWake() {
 <style scoped>
 .voice-chat {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100vh;
   background: #1a1a2e;
   color: #e0e0e0;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
-  position: relative;
+  overflow: hidden;
+}
+
+.main-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .chat-header {

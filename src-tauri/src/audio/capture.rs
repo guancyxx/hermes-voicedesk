@@ -270,7 +270,8 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     let data_size = (audio.len() * 2) as u32;
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36u32 + data_size).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&16u32.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());

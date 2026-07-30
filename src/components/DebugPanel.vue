@@ -77,18 +77,15 @@ function typeIcon(type: string): string {
 
 <style scoped>
 .debug-panel {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
   width: 380px;
-  max-width: 45vw;
+  min-width: 380px;
+  flex-shrink: 0;
   background: #0d0d1a;
   border-left: 1px solid #2a2a4a;
   display: flex;
   flex-direction: column;
-  z-index: 100;
   box-shadow: -4px 0 24px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
 }
 
 .debug-header {
