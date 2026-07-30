@@ -70,8 +70,23 @@ let responseFinished = false
 // Hidden buffer that accumulates ALL deltas (full response text for history save)
 const fullResponseText = ref('')
 
-// Regex for sentence-ending boundaries
-const SENTENCE_END_RE = /([。！？]|\n\n|[.!?](?=\s|$))/
+// Known abbreviations that should NOT end a sentence when followed by a period
+// Includes: titles, months, common Latin abbreviations, and single-letter initials
+const ABBREVIATIONS = new Set([
+  'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st',
+  'rev', 'hon', 'capt', 'lt', 'col', 'gen', 'sgt', 'maj',
+  'rep', 'sen', 'gov', 'pres', 'vp',
+  'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+  'vs', 'etc', 'inc', 'ltd', 'co', 'corp', 'dept', 'est', 'approx',
+  'vol', 'ed', 'no',
+  // Single-letter initials (A., B., etc.) common in names like "John F. Kennedy"
+  'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+  'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+])
+
+// Matches all potential sentence-ending positions: Chinese punctuation, newlines, and .!?
+// Context-aware filtering done in extractSentences() to avoid splitting on IPs/numbers/abbreviations
+const SENTENCE_END_RE = /([。！？]|\n|[.!?])/g
 
 function extractSentences(text: string): { sentences: string[]; remainder: string } {
   const sentences: string[] = []
@@ -81,13 +96,56 @@ function extractSentences(text: string): { sentences: string[]; remainder: strin
   let match: RegExpExecArray | null
 
   while ((match = re.exec(working)) !== null) {
+    const punct = match[1]
     const endIdx = match.index + match[0].length
-    const sentence = working.substring(lastEnd, endIdx).trim()
-    if (sentence) {
-      sentences.push(sentence)
+
+    // Chinese punctuation (。！？) and newlines (\n): always split
+    if (punct === '。' || punct === '！' || punct === '？' || punct === '\n') {
+      const sentence = working.substring(lastEnd, endIdx).trim()
+      if (sentence) sentences.push(sentence)
+      lastEnd = endIdx
+      re.lastIndex = lastEnd
+      continue
     }
-    lastEnd = endIdx
-    re.lastIndex = lastEnd
+
+    // ! and ? are strong sentence enders — always split
+    if (punct === '!' || punct === '?') {
+      const sentence = working.substring(lastEnd, endIdx).trim()
+      if (sentence) sentences.push(sentence)
+      lastEnd = endIdx
+      re.lastIndex = lastEnd
+      continue
+    }
+
+    // --- Period (.) only: apply context checks ---
+
+    const charBefore = match.index > 0 ? working[match.index - 1] : ''
+    const afterPunct = working.substring(endIdx)
+    const nextNonSpace = afterPunct.match(/^\s*(\S)/)?.[1] || ''
+
+    // Rule 1: Don't split on digit.digit patterns (IPs like 192.168.1.1, decimals like 3.14)
+    if (/\d/.test(charBefore) && /\d/.test(nextNonSpace)) {
+      continue
+    }
+
+    // Rule 2: Don't split on known abbreviations (Dr., Mr., Mrs., etc.)
+    const beforeMatch = working.substring(0, match.index).match(/(\w+)\.?$/)
+    if (beforeMatch) {
+      const word = beforeMatch[1].toLowerCase()
+      if (ABBREVIATIONS.has(word)) {
+        continue
+      }
+    }
+
+    // Rule 3: Split only if followed by space + capital letter, or end of text
+    // This catches genuine sentence boundaries and avoids splitting on things like filenames, URLs, etc.
+    if (!nextNonSpace || /[A-Z\u00C0-\u024F]/.test(nextNonSpace)) {
+      const sentence = working.substring(lastEnd, endIdx).trim()
+      if (sentence) sentences.push(sentence)
+      lastEnd = endIdx
+      re.lastIndex = lastEnd
+    }
+    // Otherwise, this period is likely mid-sentence — skip it
   }
 
   const remainder = working.substring(lastEnd)

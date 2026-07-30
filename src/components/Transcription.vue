@@ -10,7 +10,7 @@ const emit = defineEmits<{
 }>()
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     emit('send')
   }
