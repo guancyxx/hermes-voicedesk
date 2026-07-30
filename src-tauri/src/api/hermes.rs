@@ -1,42 +1,52 @@
 /// Hermes Agent API client.
-/// Communicates with Hermes API server at localhost:8642.
+/// Communicates with Hermes API server at 127.0.0.1:8642.
 
 use reqwest::Client;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
-const HERMES_API_BASE: &str = "http://localhost:8642";
+const HERMES_API_BASE: &str = "http://127.0.0.1:8642";
 const HERMES_API_KEY: &str = "shujietai-dev-key-2026";
 
+/// Build a reqwest client that bypasses system proxy (critical for localhost).
+fn api_client() -> Result<Client, String> {
+    Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("client build: {}", e))
+}
+
 /// Health check — returns true if Hermes API is reachable.
-pub fn check_health() -> bool {
-    let client = Client::new();
+pub async fn check_health() -> Result<bool, String> {
+    let client = api_client()?;
     let url = format!("{}/v1/models", HERMES_API_BASE);
-    match tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async {
-            client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", HERMES_API_KEY))
-                .send()
-                .await
-        }) {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+    match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", HERMES_API_KEY))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            log::info!("Hermes API check: {}", status);
+            Ok(status.is_success())
+        }
+        Err(e) => {
+            log::warn!("Hermes API HTTP check failed: {}", e);
+            Err(format!("{}", e))
+        }
     }
 }
 
 /// Send a chat message and get the full response.
 pub async fn chat(message: &str, session_id: Option<&str>) -> Result<String, String> {
-    let client = Client::new();
-    let mut payload = serde_json::json!({
-        "input": message,
-    });
+    let client = api_client()?;
+    let mut payload = serde_json::json!({ "input": message });
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }
 
-    // Step 1: Start run
     let resp = client
         .post(format!("{}/v1/runs", HERMES_API_BASE))
         .header("Authorization", format!("Bearer {}", HERMES_API_KEY))
@@ -59,7 +69,6 @@ pub async fn chat(message: &str, session_id: Option<&str>) -> Result<String, Str
         .ok_or("No run_id in response")?
         .to_string();
 
-    // Step 2: Collect SSE events
     let mut full_response = String::new();
     let mut stream = client
         .get(format!("{}/v1/runs/{}/events", HERMES_API_BASE, run_id))
@@ -93,7 +102,7 @@ pub async fn chat_stream(
     session_id: Option<&str>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = api_client()?;
     let mut payload = serde_json::json!({ "input": message });
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
@@ -138,9 +147,7 @@ pub async fn chat_stream(
                     match etype {
                         "message.delta" => {
                             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                let _ = app.emit("hermes:delta", serde_json::json!({
-                                    "content": delta
-                                }));
+                                let _ = app.emit("hermes:delta", serde_json::json!({ "content": delta }));
                             }
                         }
                         "tool.started" => {
@@ -157,9 +164,7 @@ pub async fn chat_stream(
                             }));
                         }
                         "run.completed" => {
-                            let _ = app.emit("hermes:finish", serde_json::json!({
-                                "usage": event.get("usage")
-                            }));
+                            let _ = app.emit("hermes:finish", serde_json::json!({ "usage": event.get("usage") }));
                             return Ok(());
                         }
                         "run.failed" | "run.cancelled" => {

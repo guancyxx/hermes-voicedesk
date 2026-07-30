@@ -4,7 +4,7 @@
 //! Will be replaced with silero-vad ONNX in Phase 1.5.
 
 /// RMS energy threshold for speech detection.
-const SPEECH_THRESHOLD: f64 = 500.0;
+const SPEECH_THRESHOLD: f64 = 50.0;
 
 /// Number of consecutive speech frames to confirm start.
 const START_CONFIRM_FRAMES: u32 = 5;

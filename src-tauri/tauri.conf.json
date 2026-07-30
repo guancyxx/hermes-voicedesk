@@ -50,6 +50,10 @@
     "category": "Productivity",
     "shortDescription": "Real-time voice AI desktop assistant",
     "longDescription": "Hermes VoiceDesk — A desktop window app for real-time voice conversation with Hermes Agent AI. Features system tray, global hotkey, and natural voice interaction.",
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "entitlements": "./Entitlements.plist"
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

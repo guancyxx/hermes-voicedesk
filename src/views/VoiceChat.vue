@@ -2,10 +2,10 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import AudioWave from './components/AudioWave.vue'
-import Transcription from './components/Transcription.vue'
-import ResponseCard from './components/ResponseCard.vue'
-import StateIndicator from './components/StateIndicator.vue'
+import AudioWave from '../components/AudioWave.vue'
+import Transcription from '../components/Transcription.vue'
+import ResponseCard from '../components/ResponseCard.vue'
+import StateIndicator from '../components/StateIndicator.vue'
 
 type VoiceState = 'idle' | 'listening' | 'thinking' | 'responding' | 'speaking'
 
@@ -23,8 +23,9 @@ let unlisteners: Array<() => void> = []
 onMounted(async () => {
   try {
     apiConnected.value = await invoke('check_hermes_api')
-  } catch {
+  } catch (e) {
     apiConnected.value = false
+    console.error('Hermes API check failed:', e)
   }
 
   const u1 = await listen<{ state: VoiceState }>('audio:state', (event) => {
@@ -35,32 +36,22 @@ onMounted(async () => {
     volume.value = event.payload.rms
   })
 
-  // Voice pipeline: audio captured → transcribe → Hermes
-  const u3 = await listen<{ path: string }>('stt:audio_file', async (event) => {
+  // Voice pipeline: audio captured → transcribed → Hermes
+  const u3 = await listen<{ text: string }>('stt:result', async (event) => {
+    const text = event.payload.text
+    if (!text || text.startsWith('[')) {
+      // No speech detected or STT error
+      state.value = 'listening'
+      return
+    }
+
+    userText.value = text
+    aiText.value = ''
+    toolCalls.value = []
     state.value = 'thinking'
-    transcribedText.value = 'Transcribing...'
 
     try {
-      // Try faster-whisper first, fall back to empty
-      let text = ''
-      try {
-        text = await invoke<string>('transcribe_audio', { path: event.payload.path })
-      } catch {
-        // Whisper not available, use placeholder
-        text = '[Speech detected — STT engine not available]'
-      }
-
-      transcribedText.value = text
-      if (text && text.trim()) {
-        userText.value = text
-      }
-
-      // Send to Hermes
-      aiText.value = ''
-      toolCalls.value = []
-      state.value = 'thinking'
-
-      await invoke('hermes_chat_stream', { message: text || 'Hello' })
+      await invoke('hermes_chat_stream', { message: text })
     } catch (e) {
       state.value = 'idle'
       aiText.value = `Error: ${e}`

@@ -24,8 +24,8 @@ async fn hermes_chat_stream(
 }
 
 #[tauri::command]
-fn check_hermes_api() -> Result<bool, String> {
-    Ok(api::hermes::check_health())
+async fn check_hermes_api() -> Result<bool, String> {
+    api::hermes::check_health().await
 }
 
 #[tauri::command]
@@ -61,14 +61,12 @@ fn transcribe_audio_native(path: String) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            // Logging in debug mode
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -93,9 +91,7 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
-                    "quit" => {
-                        app.exit(0);
-                    }
+                    "quit" => app.exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -114,27 +110,12 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // ---- Global Hotkey: Option+Space ----
-            use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-
-            let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-            let app_handle = app.handle().clone();
-
-            app_handle.plugin(
-                tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(move |app, _shortcut, event| {
-                        if event.state == ShortcutState::Pressed {
-                            if let Some(window) = app.get_webview_window("main") {
-                                match window.is_visible() {
-                                    Ok(true) => { let _ = window.hide(); }
-                                    _ => { let _ = window.show(); let _ = window.set_focus(); }
-                                }
-                            }
-                        }
-                    })
-                    .build(),
-            )?;
-            app_handle.global_shortcut().register(shortcut)?;
+            // ---- Global Hotkey (requires Accessibility permission) ----
+            // Only register if the plugin loads successfully.
+            match setup_global_shortcut(app) {
+                Ok(()) => log::info!("Global shortcut registered: Option+Space"),
+                Err(e) => log::warn!("Global shortcut unavailable: {}", e),
+            }
 
             Ok(())
         })
@@ -151,4 +132,34 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes VoiceDesk");
+}
+
+fn setup_global_shortcut(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+    let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+    let app_handle = app.handle().clone();
+
+    app_handle.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(move |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    if let Some(window) = app.get_webview_window("main") {
+                        match window.is_visible() {
+                            Ok(true) => {
+                                let _ = window.hide();
+                            }
+                            _ => {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                }
+            })
+            .build(),
+    )?;
+
+    app_handle.global_shortcut().register(shortcut)?;
+    Ok(())
 }
