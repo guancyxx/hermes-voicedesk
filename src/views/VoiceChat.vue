@@ -629,6 +629,11 @@ async function startNewSession() {
   sessionId.value = `voice-${now.slice(0, 10)}-${now.slice(11, 16).replace(':', '')}`
   state.value = 'idle'
   addDebugEntry('info', 'SESSION', 'Started new session', sessionId.value)
+
+  // Voice users expect the wake listener to come back on its own.
+  if (wakeEnabled.value) {
+    enterWakeMode()
+  }
 }
 
 async function sendText() {
