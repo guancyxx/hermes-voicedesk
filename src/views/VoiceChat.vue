@@ -320,6 +320,18 @@ onMounted(async () => {
   const u3 = await listen<{ text: string }>('stt:result', async (event) => {
     const text = event.payload.text
     console.log(`[VoiceChat] stt:result text="${text}"`)
+
+    // Guard: a stray near-silent clip that arrives AFTER we already have a
+    // real transcription in-flight must NOT kill the pending conversation
+    // (observed 2026-08-24: a 3-minute Hermes query was aborted mid-flight
+    // by an ambient-noise empty clip → "didn't catch that" + back to wake,
+    // so the reply never reached TTS).
+    if ((!text || text.startsWith('[')) && isProcessing) {
+      console.log('[VoiceChat] stt:result → stray empty clip while processing, ignoring')
+      addDebugEntry('info', 'STT', 'Stray empty clip during processing — ignored')
+      return
+    }
+
     addDebugEntry('success', 'STT', `Transcribed`, `text="${text}"`)
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
@@ -333,6 +345,16 @@ onMounted(async () => {
       enterWakeMode()
       return
     }
+
+    // We have real speech — stop the mic NOW. The mic must not keep running
+    // while Hermes thinks (can be minutes for tool-heavy queries): any
+    // ambient noise during that window would otherwise spawn another STT
+    // and derail the conversation. The mic comes back via enterWakeMode()
+    // after TTS completes (it is suspended during playback anyway).
+    invoke('stop_listening').catch((e) => {
+      console.warn('[VoiceChat] stop_listening after real STT result:', e)
+    })
+    isListening.value = false
 
     // Clear tool calls for new conversation round
     toolCalls.value = []
