@@ -13,6 +13,7 @@
 ///
 /// Echo prevention:
 ///   Mic is suspended BEFORE TTS begins, resumed after cooldown when TTS finishes.
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
@@ -279,9 +280,31 @@ struct GeneratedClip {
     is_temp: bool,
 }
 
+thread_local! {
+    /// Epoch captured by the generation thread BEFORE it starts spawning
+    /// sub-processes. run_tracked re-checks it after spawn: if a reset
+    /// happened in the window between the caller's epoch check and the
+    /// child being registered in GENERATION_PIDS (i.e. it escaped the kill
+    /// snapshot), we kill it ourselves immediately.
+    static GEN_EPOCH_AT_SPAWN: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn set_generation_epoch(epoch: u64) {
+    GEN_EPOCH_AT_SPAWN.with(|e| e.set(epoch));
+}
+
 fn run_tracked(cmd: &mut Command) -> io::Result<ExitStatus> {
+    let epoch_at_spawn = GEN_EPOCH_AT_SPAWN.with(|e| e.get());
     let mut child = cmd.spawn()?;
     let pid = child.id();
+    // Close the race window: if a reset bumped the epoch while we were
+    // between the caller's check and this registration, the kill snapshot
+    // missed this pid — kill it right here instead.
+    if GENERATION_EPOCH.load(Ordering::SeqCst) != epoch_at_spawn {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(io::ErrorKind::Other, "cancelled by reset"));
+    }
     GENERATION_PIDS.lock().unwrap().push(pid);
     let result = child.wait();
     GENERATION_PIDS
@@ -339,6 +362,9 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
     .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
 
     if !status.success() {
+        // Clean up any partial output — Err carries no GeneratedClip, so
+        // cleanup_originals in run_segment cannot see this file.
+        let _ = std::fs::remove_file(&output_path);
         return Err(format!("Edge-TTS exited with status: {}", status));
     }
 
@@ -684,6 +710,7 @@ fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> b
         let voice = get_voice_for_text(&text);
         let gen_epoch = GENERATION_EPOCH.load(Ordering::SeqCst);
         handles.push(std::thread::spawn(move || {
+            set_generation_epoch(gen_epoch);
             let clip_result = if use_jarvis && has_et {
                 match generate_edgetts(&text, clip_id) {
                     Ok(c) => Ok(c),
