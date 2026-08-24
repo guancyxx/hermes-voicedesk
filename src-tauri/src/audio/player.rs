@@ -25,6 +25,12 @@ use crate::audio::capture;
 /// Monotonically increasing generation counter. Incremented on every `speak()` call.
 static TTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Staged TTS segments waiting to be played in arrival order.
+static TTS_QUEUE: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+
+/// Whether a queue worker currently owns the TTS start/end lifecycle.
+static QUEUE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
@@ -608,153 +614,196 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
     capture::notify_tts_start();
     capture::suspend_mic();
 
+    std::thread::spawn(move || {
+        run_segment(texts, gen);
+        finalize_tts(&app, gen);
+    });
+
+    Ok(())
+}
+
+/// Generate and play one segment. Returns true when a newer generation aborted it.
+fn run_segment(texts: Vec<String>, gen: u64) -> bool {
     let pid = std::process::id() as u64;
     let base_clip_id = (pid * 10000 + gen * 100) as usize;
+    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
+    let has_et = has_edge_tts();
+    let has_ff = has_ffmpeg();
+    let results: Arc<Mutex<Vec<Result<GeneratedClip, String>>>> = Arc::new(Mutex::new(
+        (0..texts.len())
+            .map(|_| Err("pending".to_string()))
+            .collect(),
+    ));
+    let mut handles = Vec::new();
 
-    std::thread::spawn(move || {
-        let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
-        let has_et = has_edge_tts();
-        let has_ff = has_ffmpeg();
-
-        // ── PARALLEL GENERATION ──
-        // Spawn one thread per sentence to generate audio simultaneously
-        let results: Arc<Mutex<Vec<Result<GeneratedClip, String>>>> = Arc::new(Mutex::new(
-            (0..texts.len())
-                .map(|_| Err("pending".to_string()))
-                .collect(),
-        ));
-
-        let mut handles = Vec::new();
-
-        for (idx, text) in texts.iter().enumerate() {
-            let results = results.clone();
-            let text = text.clone();
-            let clip_id = base_clip_id + idx;
-            let use_jarvis = use_jarvis;
-            let has_et = has_et;
-            let has_ff = has_ff;
-            // Per-sentence voice selection (Chinese sentences get Chinese voice)
-            let voice = get_voice_for_text(&text);
-
-            let handle = std::thread::spawn(move || {
-                let clip_result = if use_jarvis && has_et {
-                    match generate_edgetts(&text, clip_id) {
-                        Ok(c) => Ok(c),
-                        Err(_) => {
-                            if has_ff {
-                                generate_jarvis_ffmpeg(&text, &voice, clip_id)
-                            } else {
-                                generate_say_direct(&text, &voice, clip_id)
-                            }
-                        }
-                    }
-                } else if use_jarvis && has_ff {
-                    generate_jarvis_ffmpeg(&text, &voice, clip_id)
-                } else {
-                    generate_say_direct(&text, &voice, clip_id)
-                };
-
-                if let Ok(mut guard) = results.lock() {
-                    guard[idx] = clip_result;
+    for (idx, text) in texts.iter().enumerate() {
+        let results = results.clone();
+        let text = text.clone();
+        let clip_id = base_clip_id + idx;
+        let voice = get_voice_for_text(&text);
+        handles.push(std::thread::spawn(move || {
+            let clip_result = if use_jarvis && has_et {
+                match generate_edgetts(&text, clip_id) {
+                    Ok(c) => Ok(c),
+                    Err(_) if has_ff => generate_jarvis_ffmpeg(&text, &voice, clip_id),
+                    Err(_) => generate_say_direct(&text, &voice, clip_id),
                 }
-            });
-            handles.push(handle);
-        }
+            } else if use_jarvis && has_ff {
+                generate_jarvis_ffmpeg(&text, &voice, clip_id)
+            } else {
+                generate_say_direct(&text, &voice, clip_id)
+            };
+            if let Ok(mut guard) = results.lock() {
+                guard[idx] = clip_result;
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
 
-        // Wait for ALL generation threads to complete
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        log::info!("TTS batch: all {} clips generated in parallel", texts.len());
-
-        let clips = results.lock().unwrap();
-        let mut generated_clips = Vec::new();
-        for (idx, result) in clips.iter().enumerate() {
-            match result {
-                Ok(clip) => generated_clips.push(clip),
-                Err(e) => log::warn!("TTS generation failed for clip {}: {}", idx, e),
+    log::info!("TTS batch: all {} clips generated in parallel", texts.len());
+    let clips = results.lock().unwrap();
+    let generated_clips: Vec<&GeneratedClip> = clips
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, result)| match result {
+            Ok(clip) => Some(clip),
+            Err(e) => {
+                log::warn!("TTS generation failed for clip {}: {}", idx, e);
+                None
+            }
+        })
+        .collect();
+    let cleanup_originals = || {
+        for clip in &generated_clips {
+            if clip.is_temp {
+                let _ = std::fs::remove_file(&clip.path);
             }
         }
+    };
 
-        let cleanup_originals = || {
-            for clip in &generated_clips {
-                if clip.is_temp {
-                    let _ = std::fs::remove_file(&clip.path);
-                }
-            }
-        };
+    if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+        log::info!(
+            "TTS batch: generation {} superseded, aborting playback",
+            gen
+        );
+        cleanup_originals();
+        return true;
+    }
+    if generated_clips.is_empty() {
+        return false;
+    }
 
-        // Check after all generation work and immediately before playback.
-        if TTS_GENERATION.load(Ordering::SeqCst) != gen {
-            log::info!(
-                "TTS batch: generation {} superseded, aborting playback",
-                gen
-            );
-            cleanup_originals();
-            finalize_tts(&app, gen);
-            return;
-        }
-
-        if generated_clips.is_empty() {
-            finalize_tts(&app, gen);
-            return;
-        }
-
-        // ── CONCATENATED PLAYBACK ──
-        let mut played_merged = false;
-        if has_ff {
-            match concat_batch_clips(&generated_clips, pid, gen) {
-                Ok((merged_path, temporary_paths)) => {
-                    if TTS_GENERATION.load(Ordering::SeqCst) != gen {
-                        log::info!(
-                            "TTS batch: generation {} superseded, aborting playback",
-                            gen
-                        );
-                        cleanup_files(&temporary_paths);
-                        cleanup_originals();
-                        finalize_tts(&app, gen);
-                        return;
-                    }
-                    if let Err(e) = play_file(&merged_path) {
-                        log::error!("TTS merged playback error: {}", e);
-                    } else {
-                        played_merged = true;
-                    }
-                    for path in temporary_paths {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-                Err(e) => log::warn!(
-                    "TTS batch concat failed, falling back to sequential playback: {}",
-                    e
-                ),
-            }
-        } else {
-            log::warn!("TTS batch concat unavailable: ffmpeg not found; falling back to sequential playback");
-        }
-
-        // ── SEQUENTIAL FALLBACK ──
-        if !played_merged {
-            for (idx, clip) in generated_clips.iter().enumerate() {
+    let mut played_merged = false;
+    if has_ff {
+        match concat_batch_clips(&generated_clips, pid, gen) {
+            Ok((merged_path, temporary_paths)) => {
                 if TTS_GENERATION.load(Ordering::SeqCst) != gen {
                     log::info!(
                         "TTS batch: generation {} superseded, aborting playback",
                         gen
                     );
-                    break;
+                    cleanup_files(&temporary_paths);
+                    cleanup_originals();
+                    return true;
                 }
-                if let Err(e) = play_file(&clip.path) {
-                    log::error!("TTS playback error for clip {}: {}", idx, e);
+                if let Err(e) = play_file(&merged_path) {
+                    log::error!("TTS merged playback error: {}", e);
+                } else {
+                    played_merged = true;
                 }
+                cleanup_files(&temporary_paths);
+            }
+            Err(e) => log::warn!(
+                "TTS batch concat failed, falling back to sequential playback: {}",
+                e
+            ),
+        }
+    } else {
+        log::warn!(
+            "TTS batch concat unavailable: ffmpeg not found; falling back to sequential playback"
+        );
+    }
+
+    if !played_merged {
+        for (idx, clip) in generated_clips.iter().enumerate() {
+            if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+                log::info!(
+                    "TTS batch: generation {} superseded, aborting playback",
+                    gen
+                );
+                cleanup_originals();
+                return true;
+            }
+            if let Err(e) = play_file(&clip.path) {
+                log::error!("TTS playback error for clip {}: {}", idx, e);
             }
         }
+    }
+    cleanup_originals();
+    false
+}
 
-        cleanup_originals();
+/// Queue a staged batch without interrupting the segment currently playing.
+pub fn speak_batch_queued(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
+    if texts.is_empty() {
+        return Ok(());
+    }
 
-        finalize_tts(&app, gen);
+    let should_start = {
+        let mut queue = TTS_QUEUE.lock().unwrap();
+        queue.push(texts);
+        !QUEUE_ACTIVE.swap(true, Ordering::SeqCst)
+    };
+    if !should_start {
+        return Ok(());
+    }
+
+    let gen = TTS_GENERATION.load(Ordering::SeqCst);
+    capture::notify_tts_start();
+    capture::suspend_mic();
+    std::thread::spawn(move || loop {
+        let segment = {
+            let mut queue = TTS_QUEUE.lock().unwrap();
+            if TTS_GENERATION.load(Ordering::SeqCst) != gen || !QUEUE_ACTIVE.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            if queue.is_empty() {
+                QUEUE_ACTIVE.store(false, Ordering::SeqCst);
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        };
+
+        let Some(segment) = segment else {
+            let _ = app.emit("tts:complete", serde_json::json!({}));
+            let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            capture::resume_mic();
+            capture::notify_tts_end();
+            return;
+        };
+
+        if run_segment(segment, gen) {
+            return;
+        }
     });
+    Ok(())
+}
 
+/// Clear all staged speech and invalidate the active queue worker.
+pub fn reset_tts_queue() -> Result<(), String> {
+    TTS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    TTS_QUEUE.lock().unwrap().clear();
+    stop_child_process();
+
+    capture::resume_mic();
+    if QUEUE_ACTIVE.swap(false, Ordering::SeqCst) {
+        capture::notify_tts_end();
+    }
     Ok(())
 }
 
@@ -808,16 +857,12 @@ fn stop_child_process() {
 /// Stop current speech immediately.
 /// Called when the user interrupts or a new response arrives.
 pub fn stop() -> Result<(), String> {
-    stop_child_process();
+    reset_tts_queue()?;
 
     // Safety net: kill any stray `say`, `afplay`, or `edge-tts` processes
     let _ = Command::new("killall").arg("say").output();
     let _ = Command::new("killall").arg("afplay").output();
     let _ = Command::new("killall").arg("edge-tts").output();
-
-    // Resume mic immediately so the user can speak again
-    capture::resume_mic();
-    capture::notify_tts_end();
 
     Ok(())
 }

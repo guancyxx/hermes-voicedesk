@@ -60,12 +60,16 @@ function clearDebugLog() {
   debugLog.value = []
 }
 
-// --- Parallel TTS: accumulate ALL sentences, generate in parallel, then play ---
+// --- Staged TTS: flush sentence groups while the response is still streaming ---
+const STAGED_TTS_SEGMENT_SIZE = 3
+const STAGED_TTS_SILENCE_MS = 1500
 const sentenceBuffer = ref('')
-const pendingSentences: string[] = []  // All sentences accumulated during streaming
+const pendingSentences: string[] = []
 let isTtsActive = false
 let isProcessing = false
 let responseFinished = false
+let lastDeltaAt = 0
+let stagedFlushTimer: ReturnType<typeof setTimeout> | null = null
 // Timestamp of the last completed TTS playback. STT results arriving within
 // a short window after it are late stragglers (in-flight transcription of
 // echo / residual buffer) and must NOT start a new conversation turn.
@@ -156,45 +160,55 @@ function extractSentences(text: string): { sentences: string[]; remainder: strin
   return { sentences, remainder }
 }
 
-// Accumulate sentences during streaming. All TTS generation happens in parallel
-// when the response finishes — not sentence-by-sentence during streaming.
 function enqueueSentence(sentence: string) {
   const trimmed = sentence.trim()
   if (!trimmed) return
   pendingSentences.push(trimmed)
 }
 
-// Called when the Hermes response is fully complete.
-// Generates ALL sentences in parallel, then plays them sequentially.
-function startBatchTTS() {
-  if (!responseFinished) return
-  if (pendingSentences.length === 0) {
+function flushPendingSegment() {
+  if (pendingSentences.length === 0) return
+
+  const sentences = pendingSentences.splice(0)
+  if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
+    for (const sentence of sentences) {
+      messages.value[messages.value.length - 1].text += sentence
+    }
+    scrollToBottom()
+  }
+
+  addDebugEntry('info', 'TTS', `Queueing staged TTS segment with ${sentences.length} sentences`)
+  invoke('speak_batch_queued', { texts: sentences }).catch((e) => {
+    console.error('speak_batch_queued failed:', e)
+    addDebugEntry('error', 'TTS', 'speak_batch_queued failed', String(e))
+    isTtsActive = false
     enterWakeMode()
+  })
+}
+
+function startBatchTTS() {
+  if (pendingSentences.length === 0) {
+    if (responseFinished && !isTtsActive) enterWakeMode()
     return
   }
 
   isTtsActive = true
   state.value = 'speaking'
+  flushPendingSegment()
+}
 
-  // Reveal ALL sentences in the chat bubble immediately (text appears with audio)
-  if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
-    for (const s of pendingSentences) {
-      messages.value[messages.value.length - 1].text += s
-    }
-    scrollToBottom()
+function maybeStagedFlush(force: boolean) {
+  const silenceElapsed = pendingSentences.length > 0
+    && Date.now() - lastDeltaAt >= STAGED_TTS_SILENCE_MS
+  if (!force && pendingSentences.length < STAGED_TTS_SEGMENT_SIZE && !silenceElapsed) {
+    return
   }
 
-  const sentencesCopy = [...pendingSentences]
-  pendingSentences.length = 0
-
-  addDebugEntry('info', 'TTS', `Starting parallel TTS for ${sentencesCopy.length} sentences`)
-
-  invoke('speak_batch', { texts: sentencesCopy }).catch((e) => {
-    console.error('speak_batch failed:', e)
-    addDebugEntry('error', 'TTS', 'speak_batch failed', String(e))
-    isTtsActive = false
-    enterWakeMode()
-  })
+  if (stagedFlushTimer !== null) {
+    clearTimeout(stagedFlushTimer)
+    stagedFlushTimer = null
+  }
+  startBatchTTS()
 }
 
 function scrollToBottom() {
@@ -377,7 +391,11 @@ onMounted(async () => {
     toolCalls.value = []
 
     // Stop any in-progress TTS
-    invoke('stop_speaking').catch(() => {})
+    invoke('reset_tts_queue').catch(() => {})
+    if (stagedFlushTimer !== null) {
+      clearTimeout(stagedFlushTimer)
+      stagedFlushTimer = null
+    }
     pendingSentences.length = 0
     isTtsActive = false
     sentenceBuffer.value = ''
@@ -430,6 +448,13 @@ onMounted(async () => {
       enqueueSentence(s)
     }
     sentenceBuffer.value = remainder
+    lastDeltaAt = Date.now()
+    if (stagedFlushTimer !== null) clearTimeout(stagedFlushTimer)
+    stagedFlushTimer = setTimeout(() => {
+      stagedFlushTimer = null
+      maybeStagedFlush(false)
+    }, STAGED_TTS_SILENCE_MS)
+    maybeStagedFlush(false)
     scrollToBottom()
   })
 
@@ -452,6 +477,10 @@ onMounted(async () => {
 
   const u6 = await listen('hermes:finish', () => {
     responseFinished = true
+    if (stagedFlushTimer !== null) {
+      clearTimeout(stagedFlushTimer)
+      stagedFlushTimer = null
+    }
     // Mark all active tools as completed
     for (const tc of toolCalls.value) {
       if (tc.status === 'started') {
@@ -480,8 +509,7 @@ onMounted(async () => {
       }
     }
 
-    // Start parallel TTS for all accumulated sentences
-    startBatchTTS()
+    maybeStagedFlush(true)
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
@@ -496,13 +524,17 @@ onMounted(async () => {
 
   // TTS batch complete — all sentences finished playing
   const u8 = await listen('tts:complete', () => {
-    addDebugEntry('info', 'TTS', 'TTS batch complete — all sentences played')
+    addDebugEntry('info', 'TTS', 'TTS queue drained — all staged sentences played')
     isTtsActive = false
     lastTtsCompleteAt = Date.now()
     // Pin chat to the latest content after playback finishes — the user must
     // end up looking at the final reply, not somewhere mid-history.
     scrollToBottom()
-    enterWakeMode()
+    if (responseFinished) {
+      enterWakeMode()
+    } else {
+      state.value = 'responding'
+    }
   })
 
   unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11]
@@ -512,6 +544,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (stagedFlushTimer !== null) clearTimeout(stagedFlushTimer)
   unlisteners.forEach((u) => u())
   invoke('stop_wake_word').catch(() => {})
 })
@@ -550,6 +583,11 @@ async function sendText() {
 
   // Stop wake word
   await invoke('stop_wake_word')
+  await invoke('reset_tts_queue')
+  if (stagedFlushTimer !== null) {
+    clearTimeout(stagedFlushTimer)
+    stagedFlushTimer = null
+  }
 
   // Add user message to chat history
   messages.value.push({ role: 'user', text })
