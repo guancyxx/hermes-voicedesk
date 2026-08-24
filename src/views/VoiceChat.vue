@@ -66,6 +66,10 @@ const pendingSentences: string[] = []  // All sentences accumulated during strea
 let isTtsActive = false
 let isProcessing = false
 let responseFinished = false
+// Timestamp of the last completed TTS playback. STT results arriving within
+// a short window after it are late stragglers (in-flight transcription of
+// echo / residual buffer) and must NOT start a new conversation turn.
+let lastTtsCompleteAt = 0
 
 // Hidden buffer that accumulates ALL deltas (full response text for history save)
 const fullResponseText = ref('')
@@ -338,6 +342,15 @@ onMounted(async () => {
       return
     }
 
+    // Late straggler check: an STT result arriving right after TTS finished
+    // is echo/residual buffer, not a new user utterance — drop it.
+    if (text && !text.startsWith('[') && lastTtsCompleteAt > 0
+        && Date.now() - lastTtsCompleteAt < 2000) {
+      console.log('[VoiceChat] stt:result → late straggler after TTS complete, ignoring')
+      addDebugEntry('info', 'STT', 'Late straggler after TTS complete — ignored')
+      return
+    }
+
     addDebugEntry('success', 'STT', `Transcribed`, `text="${text}"`)
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
@@ -477,6 +490,7 @@ onMounted(async () => {
   const u8 = await listen('tts:complete', () => {
     addDebugEntry('info', 'TTS', 'TTS batch complete — all sentences played')
     isTtsActive = false
+    lastTtsCompleteAt = Date.now()
     enterWakeMode()
   })
 
