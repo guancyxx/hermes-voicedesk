@@ -61,6 +61,13 @@ fn speak_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
     audio::player::speak(&text, app)
 }
 
+/// Speak multiple sentences in parallel (generate all at once, play sequentially).
+/// Called when the full response is ready for TTS playback.
+#[tauri::command]
+fn speak_batch(texts: Vec<String>, app: tauri::AppHandle) -> Result<(), String> {
+    audio::player::speak_batch(texts, app)
+}
+
 #[tauri::command]
 fn stop_speaking() -> Result<(), String> {
     audio::player::stop()
@@ -285,6 +292,7 @@ pub fn run() {
             save_chat_history,
             load_chat_history,
             speak_text,
+            speak_batch,
             stop_speaking,
             notify_tts_start,
             notify_tts_end,

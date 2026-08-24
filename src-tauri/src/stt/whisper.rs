@@ -16,7 +16,7 @@ except ImportError:
     sys.exit(1)
 
 model = WhisperModel("{}", device="auto", compute_type="auto")
-segments, info = model.transcribe("{}", beam_size=5, language="zh")
+segments, info = model.transcribe("{}", beam_size=5)
 text = " ".join(s.text.strip() for s in segments)
 print(text)
 "#,

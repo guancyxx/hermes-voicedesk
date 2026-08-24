@@ -243,174 +243,229 @@ fn spawn_vad_wake(app: AppHandle) {
     std::thread::spawn(move || {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-        let host = cpal::default_host();
-        let device = match host.default_input_device() {
-            Some(d) => d,
-            None => {
-                log::error!("VAD wake: no microphone");
-                let _ = app_handle.emit(
-                    "wake:error",
-                    serde_json::json!({"error": "No microphone"}),
-                );
-                WAKE_ACTIVE.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        let supported_cfg = match device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("VAD wake: config error: {}", e);
-                WAKE_ACTIVE.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        let sample_rate = supported_cfg.sample_rate();
-        log::info!(
-            "VAD wake: {}Hz microphone, config={:?}",
-            sample_rate,
-            supported_cfg
-        );
-
-        let config = supported_cfg.config().clone();
-
-        // Shared state for the audio callback
-        let speech_frames = Arc::new(AtomicU32::new(0));
-        let silence_frames = Arc::new(AtomicU32::new(0));
-        let last_rms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        let speech_frames_cb = speech_frames.clone();
-        let silence_frames_cb = silence_frames.clone();
-        let last_rms_cb = last_rms.clone();
-        let app_cb = app_handle.clone();
-
         // VAD parameters (tuned for reliable speech detection)
-        // RMS threshold: 0.003 is sensitive enough for normal speech at arm's length
+        // RMS threshold: 0.003 balances sensitivity vs noise rejection.
+        // 0.002 was too sensitive — ambient noise triggered endless wake→listen loops.
         const RMS_THRESHOLD: f64 = 0.003;
-        // Frames of sustained speech needed to trigger (~0.6s at 30ms frames)
-        const TRIGGER_FRAMES: u32 = 20;
-        // Silence frames needed to reset the counter (~1.5s)
-        const SILENCE_RESET_FRAMES: u32 = 50;
+        // Frames of sustained speech needed to trigger (~0.45s at 30ms frames)
+        const TRIGGER_FRAMES: u32 = 15;
+        // Silence frames needed to reset the counter (~1.2s)
+        const SILENCE_RESET_FRAMES: u32 = 40;
 
-        let _ = app_handle.emit(
-            "wake:state",
-            serde_json::json!({
-                "state": "waiting",
-                "mode": "vad",
-                "keyword": "[any speech]",
-                "rms_threshold": RMS_THRESHOLD,
-                "trigger_frames": TRIGGER_FRAMES,
-            }),
-        );
+        // The input device can be renegotiated under us (observed 2026-08-24:
+        // "Device sample rate changed" right after launch when the default mic
+        // gets reset, e.g. by a virtual audio driver). cpal then kills the
+        // stream via the error callback; only logging it left wake detection
+        // permanently dead. Rebuild the stream with a FRESH device + config.
+        const MAX_STREAM_RETRIES: u32 = 5;
+        const RETRY_DELAY_MS: u64 = 500;
 
-        log::info!(
-            "VAD wake: RMS threshold={}, trigger={} frames (~{:.1}s)",
-            RMS_THRESHOLD,
-            TRIGGER_FRAMES,
-            TRIGGER_FRAMES as f64 * 0.03,
-        );
+        let mut retries: u32 = 0;
 
-        let stream = match device.build_input_stream(
-            config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !WAKE_ACTIVE.load(Ordering::SeqCst) {
+        loop {
+            let host = cpal::default_host();
+            let device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    log::error!("VAD wake: no microphone");
+                    let _ = app_handle.emit(
+                        "wake:error",
+                        serde_json::json!({"error": "No microphone"}),
+                    );
+                    WAKE_ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
+            };
 
-                let sum: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
-                let rms = (sum / data.len() as f64).sqrt();
-                let is_speech = rms > RMS_THRESHOLD;
+            let supported_cfg = match device.default_input_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("VAD wake: config error: {}", e);
+                    WAKE_ACTIVE.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
 
-                // Store RMS for debug (as fixed-point u64: integer part + 6 decimal places)
-                last_rms_cb.store((rms * 1_000_000.0) as u64, Ordering::Relaxed);
+            let sample_rate = supported_cfg.sample_rate();
+            log::info!(
+                "VAD wake: {}Hz microphone, config={:?}",
+                sample_rate,
+                supported_cfg
+            );
 
-                if is_speech {
-                    let sf = speech_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
-                    silence_frames_cb.store(0, Ordering::SeqCst);
+            let config = supported_cfg.config().clone();
 
-                    // Log progress every 10 frames
-                    if sf % 10 == 0 {
-                        log::debug!(
-                            "VAD wake: speech frame {}/{} (RMS={:.6})",
-                            sf,
-                            TRIGGER_FRAMES,
-                            rms
-                        );
+            // Set by the cpal error callback — tells the keep-alive loop to
+            // drop the stream and rebuild with a fresh device + fresh counters.
+            let stream_failed = Arc::new(AtomicBool::new(false));
+            let stream_failed_err = stream_failed.clone();
+
+            // Shared state for the audio callback (fresh per stream attempt —
+            // stale speech/silence counters must not leak across rebuilds)
+            let speech_frames = Arc::new(AtomicU32::new(0));
+            let silence_frames = Arc::new(AtomicU32::new(0));
+            let last_rms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+            let speech_frames_cb = speech_frames.clone();
+            let silence_frames_cb = silence_frames.clone();
+            let last_rms_cb = last_rms.clone();
+            let app_cb = app_handle.clone();
+
+            let _ = app_handle.emit(
+                "wake:state",
+                serde_json::json!({
+                    "state": "waiting",
+                    "mode": "vad",
+                    "keyword": "[any speech]",
+                    "rms_threshold": RMS_THRESHOLD,
+                    "trigger_frames": TRIGGER_FRAMES,
+                    "retry": retries,
+                }),
+            );
+
+            log::info!(
+                "VAD wake: RMS threshold={}, trigger={} frames (~{:.1}s)",
+                RMS_THRESHOLD,
+                TRIGGER_FRAMES,
+                TRIGGER_FRAMES as f64 * 0.03,
+            );
+
+            let stream = match device.build_input_stream(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !WAKE_ACTIVE.load(Ordering::SeqCst) {
+                        return;
                     }
 
-                    if sf >= TRIGGER_FRAMES {
-                        log::info!(
-                            "VAD wake: speech detected ({} frames, RMS={:.6})",
-                            sf,
-                            rms
-                        );
-                        WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
-                        let _ = app_cb.emit(
-                            "wake:detected",
-                            serde_json::json!({"keyword": "[speech]", "mode": "vad", "rms": rms, "frames": sf}),
-                        );
-                        WAKE_ACTIVE.store(false, Ordering::SeqCst);
-                    }
-                } else {
-                    let sil = silence_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
-                    if sil > SILENCE_RESET_FRAMES {
-                        let old = speech_frames_cb.swap(0, Ordering::SeqCst);
-                        if old > 5 {
+                    let sum: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
+                    let rms = (sum / data.len() as f64).sqrt();
+                    let is_speech = rms > RMS_THRESHOLD;
+
+                    // Store RMS for debug (as fixed-point u64: integer part + 6 decimal places)
+                    last_rms_cb.store((rms * 1_000_000.0) as u64, Ordering::Relaxed);
+
+                    if is_speech {
+                        let sf = speech_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
+                        silence_frames_cb.store(0, Ordering::SeqCst);
+
+                        // Log progress every 10 frames
+                        if sf % 10 == 0 {
                             log::debug!(
-                                "VAD wake: reset speech counter (was {} frames, RMS at reset={:.6})",
-                                old,
+                                "VAD wake: speech frame {}/{} (RMS={:.6})",
+                                sf,
+                                TRIGGER_FRAMES,
                                 rms
                             );
                         }
+
+                        if sf >= TRIGGER_FRAMES {
+                            log::info!(
+                                "VAD wake: speech detected ({} frames, RMS={:.6})",
+                                sf,
+                                rms
+                            );
+                            WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
+                            let _ = app_cb.emit(
+                                "wake:detected",
+                                serde_json::json!({"keyword": "[speech]", "mode": "vad", "rms": rms, "frames": sf}),
+                            );
+                            WAKE_ACTIVE.store(false, Ordering::SeqCst);
+                        }
+                    } else {
+                        let sil = silence_frames_cb.fetch_add(1, Ordering::SeqCst) + 1;
+                        if sil > SILENCE_RESET_FRAMES {
+                            let old = speech_frames_cb.swap(0, Ordering::SeqCst);
+                            if old > 5 {
+                                log::debug!(
+                                    "VAD wake: reset speech counter (was {} frames, RMS at reset={:.6})",
+                                    old,
+                                    rms
+                                );
+                            }
+                        }
                     }
+                },
+                move |err| {
+                    log::error!("VAD wake audio error: {}", err);
+                    stream_failed_err.store(true, Ordering::SeqCst);
+                },
+                None,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("VAD wake: stream build error: {}", e);
+                    let _ = app_handle.emit(
+                        "wake:error",
+                        serde_json::json!({"error": format!("Stream build error: {}", e)}),
+                    );
+                    WAKE_ACTIVE.store(false, Ordering::SeqCst);
+                    return;
                 }
-            },
-            move |err| {
-                log::error!("VAD wake audio error: {}", err);
-            },
-            None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("VAD wake: stream build error: {}", e);
+            };
+
+            if let Err(e) = stream.play() {
+                log::error!("VAD wake: stream play error: {}", e);
                 let _ = app_handle.emit(
                     "wake:error",
-                    serde_json::json!({"error": format!("Stream build error: {}", e)}),
+                    serde_json::json!({"error": format!("Stream play error: {}", e)}),
                 );
                 WAKE_ACTIVE.store(false, Ordering::SeqCst);
                 return;
             }
-        };
 
-        if let Err(e) = stream.play() {
-            log::error!("VAD wake: stream play error: {}", e);
-            let _ = app_handle.emit(
-                "wake:error",
-                serde_json::json!({"error": format!("Stream play error: {}", e)}),
-            );
-            WAKE_ACTIVE.store(false, Ordering::SeqCst);
-            return;
-        }
+            // Emit RMS debug values periodically (every second) — tied to this
+            // stream attempt so the old thread exits when the stream dies.
+            let last_rms_ref = last_rms.clone();
+            let stream_failed_dbg = stream_failed.clone();
+            std::thread::spawn(move || {
+                while WAKE_ACTIVE.load(Ordering::SeqCst)
+                    && !stream_failed_dbg.load(Ordering::SeqCst)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    let raw = last_rms_ref.load(Ordering::Relaxed);
+                    let rms = raw as f64 / 1_000_000.0;
+                    log::debug!("VAD wake: current RMS={:.6} (threshold={})", rms, RMS_THRESHOLD);
+                }
+            });
 
-        // Emit RMS debug values periodically (every second)
-        let last_rms_ref = last_rms.clone();
-        std::thread::spawn(move || {
-            while WAKE_ACTIVE.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-                let raw = last_rms_ref.load(Ordering::Relaxed);
-                let rms = raw as f64 / 1_000_000.0;
-                log::debug!("VAD wake: current RMS={:.6} (threshold={})", rms, RMS_THRESHOLD);
+            // Keep stream alive while active and healthy
+            while WAKE_ACTIVE.load(Ordering::SeqCst)
+                && !stream_failed.load(Ordering::SeqCst)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-        });
 
-        // Keep stream alive while active
-        while WAKE_ACTIVE.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(stream);
+
+            if !WAKE_ACTIVE.load(Ordering::SeqCst) {
+                // Stopped normally (user stop_wake_word, or wake detected)
+                log::info!("VAD wake detection ended");
+                return;
+            }
+
+            // Stream died while still active → rebuild after a short delay
+            retries += 1;
+            if retries > MAX_STREAM_RETRIES {
+                log::error!(
+                    "VAD wake: stream kept failing, giving up after {} retries",
+                    MAX_STREAM_RETRIES
+                );
+                let _ = app_handle.emit(
+                    "wake:error",
+                    serde_json::json!({"error": format!("VAD stream failed after {} retries", MAX_STREAM_RETRIES)}),
+                );
+                WAKE_ACTIVE.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            log::warn!(
+                "VAD wake: stream died, rebuilding ({}/{}), waiting {}ms",
+                retries,
+                MAX_STREAM_RETRIES,
+                RETRY_DELAY_MS
+            );
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
         }
-
-        drop(stream);
-        log::info!("VAD wake detection ended");
     });
 }
 

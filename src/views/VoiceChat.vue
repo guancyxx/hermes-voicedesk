@@ -60,9 +60,9 @@ function clearDebugLog() {
   debugLog.value = []
 }
 
-// --- Sentence-boundary streaming TTS ---
+// --- Parallel TTS: accumulate ALL sentences, generate in parallel, then play ---
 const sentenceBuffer = ref('')
-const ttsQueue: string[] = []
+const pendingSentences: string[] = []  // All sentences accumulated during streaming
 let isTtsActive = false
 let isProcessing = false
 let responseFinished = false
@@ -152,38 +152,44 @@ function extractSentences(text: string): { sentences: string[]; remainder: strin
   return { sentences, remainder }
 }
 
+// Accumulate sentences during streaming. All TTS generation happens in parallel
+// when the response finishes — not sentence-by-sentence during streaming.
 function enqueueSentence(sentence: string) {
   const trimmed = sentence.trim()
   if (!trimmed) return
-  ttsQueue.push(trimmed)
-  if (!isTtsActive) {
-    speakNextInQueue()
-  }
+  pendingSentences.push(trimmed)
 }
 
-function speakNextInQueue() {
-  if (ttsQueue.length === 0) {
-    isTtsActive = false
-    if (responseFinished) {
-      // Go back to wake word mode instead of idle
-      enterWakeMode()
-    }
+// Called when the Hermes response is fully complete.
+// Generates ALL sentences in parallel, then plays them sequentially.
+function startBatchTTS() {
+  if (!responseFinished) return
+  if (pendingSentences.length === 0) {
+    enterWakeMode()
     return
   }
 
   isTtsActive = true
   state.value = 'speaking'
-  const sentence = ttsQueue.shift()!
 
-  // Reveal sentence in chat bubble AS TTS starts (text appears with audio)
+  // Reveal ALL sentences in the chat bubble immediately (text appears with audio)
   if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
-    messages.value[messages.value.length - 1].text += sentence
+    for (const s of pendingSentences) {
+      messages.value[messages.value.length - 1].text += s
+    }
     scrollToBottom()
   }
 
-  invoke('speak_text', { text: sentence }).catch((e) => {
-    console.error('speak_text failed:', e)
-    speakNextInQueue()
+  const sentencesCopy = [...pendingSentences]
+  pendingSentences.length = 0
+
+  addDebugEntry('info', 'TTS', `Starting parallel TTS for ${sentencesCopy.length} sentences`)
+
+  invoke('speak_batch', { texts: sentencesCopy }).catch((e) => {
+    console.error('speak_batch failed:', e)
+    addDebugEntry('error', 'TTS', 'speak_batch failed', String(e))
+    isTtsActive = false
+    enterWakeMode()
   })
 }
 
@@ -208,17 +214,33 @@ function enterWakeMode() {
     state.value = 'idle'
     return
   }
-  // Stop any active mic capture
-  invoke('stop_listening').catch(() => {})
-  isListening.value = false
 
-  // Start wake word detection
-  invoke('start_wake_word', {
-    accessKey: null,
-    keyword: 'jarvis',
-  }).catch((e) => console.error('start_wake_word failed:', e))
-
+  // Sequential cleanup with proper awaits to avoid mic stream conflicts:
+  // 1. Stop mic capture (must complete before wake word tries to open the mic)
+  // 2. Wait for the cpal stream to be fully dropped
+  // 3. Start wake word detection
   state.value = 'waiting'
+  ;(async () => {
+    try {
+      await invoke('stop_listening')
+    } catch (e) {
+      console.warn('[VoiceChat] stop_listening during enterWakeMode:', e)
+    }
+    isListening.value = false
+
+    // Give the OS a moment to fully release the audio device
+    await new Promise((r) => setTimeout(r, 300))
+
+    try {
+      await invoke('start_wake_word', {
+        accessKey: null,
+        keyword: 'jarvis',
+      })
+    } catch (e) {
+      console.error('start_wake_word failed:', e)
+      addDebugEntry('error', 'WAKE', 'start_wake_word failed', String(e))
+    }
+  })()
 }
 
 let unlisteners: Array<() => void> = []
@@ -280,9 +302,9 @@ onMounted(async () => {
     async () => {
       addDebugEntry('success', 'WAKE', 'Wake word detected!', 'Starting listening...')
       // Wake word detected! Stop wake word and start listening.
-      invoke('stop_wake_word').catch(() => {})
-      // Small delay for clean transition
-      await new Promise((r) => setTimeout(r, 200))
+      await invoke('stop_wake_word').catch(() => {})
+      // Wait for the VAD stream to be fully dropped before opening capture stream
+      await new Promise((r) => setTimeout(r, 300))
       await startListening()
     }
   )
@@ -298,22 +320,48 @@ onMounted(async () => {
   const u3 = await listen<{ text: string }>('stt:result', async (event) => {
     const text = event.payload.text
     console.log(`[VoiceChat] stt:result text="${text}"`)
+
+    // Guard: a stray near-silent clip that arrives AFTER we already have a
+    // real transcription in-flight must NOT kill the pending conversation
+    // (observed 2026-08-24: a 3-minute Hermes query was aborted mid-flight
+    // by an ambient-noise empty clip → "didn't catch that" + back to wake,
+    // so the reply never reached TTS).
+    if ((!text || text.startsWith('[')) && isProcessing) {
+      console.log('[VoiceChat] stt:result → stray empty clip while processing, ignoring')
+      addDebugEntry('info', 'STT', 'Stray empty clip during processing — ignored')
+      return
+    }
+
     addDebugEntry('success', 'STT', `Transcribed`, `text="${text}"`)
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
       addDebugEntry('warning', 'STT', 'Empty or failed transcription', `raw="${text}"`)
       messages.value.push({ role: 'ai', text: "Sorry, I didn't catch that." })
       scrollToBottom()
-      state.value = 'idle'
+      // Must stop mic and re-enter wake mode — otherwise the still-running
+      // mic capture will detect more noise and loop endlessly.
+      invoke('stop_listening').catch(() => {})
+      isListening.value = false
+      enterWakeMode()
       return
     }
+
+    // We have real speech — stop the mic NOW. The mic must not keep running
+    // while Hermes thinks (can be minutes for tool-heavy queries): any
+    // ambient noise during that window would otherwise spawn another STT
+    // and derail the conversation. The mic comes back via enterWakeMode()
+    // after TTS completes (it is suspended during playback anyway).
+    invoke('stop_listening').catch((e) => {
+      console.warn('[VoiceChat] stop_listening after real STT result:', e)
+    })
+    isListening.value = false
 
     // Clear tool calls for new conversation round
     toolCalls.value = []
 
     // Stop any in-progress TTS
     invoke('stop_speaking').catch(() => {})
-    ttsQueue.length = 0
+    pendingSentences.length = 0
     isTtsActive = false
     sentenceBuffer.value = ''
     fullResponseText.value = ''
@@ -395,7 +443,7 @@ onMounted(async () => {
     }
     addDebugEntry('success', 'API', 'Stream finished', `Total AI message length: ${fullResponseText.value.length}`)
 
-    // Flush any remaining text in the buffer
+    // Flush any remaining text in the buffer as a final sentence
     if (sentenceBuffer.value.trim()) {
       enqueueSentence(sentenceBuffer.value)
       sentenceBuffer.value = ''
@@ -415,10 +463,8 @@ onMounted(async () => {
       }
     }
 
-    if (ttsQueue.length === 0 && !isTtsActive) {
-      // Go back to wake word mode
-      enterWakeMode()
-    }
+    // Start parallel TTS for all accumulated sentences
+    startBatchTTS()
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
@@ -431,12 +477,11 @@ onMounted(async () => {
     enterWakeMode()
   })
 
-  // TTS completion — next sentence can start now
-  // Sentence was already revealed in speakNextInQueue() when TTS started.
-  // Just advance the queue so the next sentence plays when ready.
+  // TTS batch complete — all sentences finished playing
   const u8 = await listen('tts:complete', () => {
-    addDebugEntry('info', 'TTS', 'TTS sentence complete')
-    speakNextInQueue()
+    addDebugEntry('info', 'TTS', 'TTS batch complete — all sentences played')
+    isTtsActive = false
+    enterWakeMode()
   })
 
   unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11]
@@ -455,7 +500,7 @@ async function startListening() {
   addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   sentenceBuffer.value = ''
   fullResponseText.value = ''
-  ttsQueue.length = 0
+  pendingSentences.length = 0
   isTtsActive = false
   isProcessing = false
   responseFinished = false
@@ -469,8 +514,9 @@ async function toggleListening() {
     isListening.value = false
     enterWakeMode()
   } else {
-    // Stop wake word first
+    // Stop wake word first — must await to ensure VAD stream is dropped
     await invoke('stop_wake_word')
+    await new Promise((r) => setTimeout(r, 300))
     await startListening()
   }
 }
@@ -491,7 +537,7 @@ async function sendText() {
 
   sentenceBuffer.value = ''
   fullResponseText.value = ''
-  ttsQueue.length = 0
+  pendingSentences.length = 0
   isTtsActive = false
   responseFinished = false
   toolCalls.value = []
