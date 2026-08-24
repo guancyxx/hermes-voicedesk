@@ -40,6 +40,13 @@ static QUEUE_CV: Condvar = Condvar::new();
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Generation epoch: bumped by every reset_tts_queue(). Generation threads
+/// capture the epoch at start; a killed sub-process returning failure must NOT
+/// fall back to spawning a NEW sub-process (say/ffmpeg) after a reset — that
+/// would escape the kill snapshot and keep burning CPU/disk after the round
+/// was cancelled.
+static GENERATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Generation processes are tracked separately from the playback child.
 static GENERATION_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -675,10 +682,16 @@ fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> b
         let text = text.clone();
         let clip_id = base_clip_id + idx;
         let voice = get_voice_for_text(&text);
+        let gen_epoch = GENERATION_EPOCH.load(Ordering::SeqCst);
         handles.push(std::thread::spawn(move || {
             let clip_result = if use_jarvis && has_et {
                 match generate_edgetts(&text, clip_id) {
                     Ok(c) => Ok(c),
+                    // Cancel barrier: if a reset killed this sub-process, do NOT
+                    // spawn a fallback — the round is gone.
+                    Err(e) if GENERATION_EPOCH.load(Ordering::SeqCst) != gen_epoch => {
+                        Err(format!("cancelled by reset: {}", e))
+                    }
                     Err(_) if has_ff => generate_jarvis_ffmpeg(&text, &voice, clip_id),
                     Err(_) => generate_say_direct(&text, &voice, clip_id),
                 }
@@ -817,8 +830,18 @@ pub fn speak_batch_queued(
             active: false,
             round_id: 0,
         });
-        if !texts.is_empty() {
+        let has_texts = !texts.is_empty();
+        if has_texts {
             state.segments.push_back(texts);
+        }
+        // A new conversation round starts here: if a previous reset set
+        // finished=true (to retire the old worker), the first enqueue of the
+        // new round must clear it — otherwise the new worker sees an empty
+        // queue + finished and immediately emits a spurious tts:complete.
+        // Setting finished=false on a NON-empty enqueue is always safe: it can
+        // only defer the finish until the real final_segment arrives.
+        if has_texts {
+            state.finished = false;
         }
         if final_segment {
             state.finished = true;
@@ -887,7 +910,15 @@ fn queue_worker(app: AppHandle, round_id: u64) {
         let _ = app.emit("tts:complete", serde_json::json!({}));
         let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
         std::thread::sleep(std::time::Duration::from_millis(500));
-        capture::resume_mic();
+        // Re-validate after the cooldown: if a reset (or a new round) started
+        // during the sleep, this worker must NOT touch the mic — the new
+        // round owns it now.
+        let still_current = QUEUE.lock().unwrap().as_ref().is_some_and(|state| {
+            state.active && state.round_id == round_id
+        });
+        if still_current {
+            capture::resume_mic();
+        }
         let mut queue = QUEUE.lock().unwrap();
         if let Some(state) = queue.as_mut() {
             if state.active && state.round_id == round_id {
@@ -918,6 +949,10 @@ pub fn reset_tts_queue() -> Result<(), String> {
     };
     QUEUE_CV.notify_all();
     stop_child_process();
+    // Cancel barrier FIRST: bump the epoch so in-flight generation threads
+    // that get killed here do not fall back to spawning new sub-processes,
+    // then kill the tracked ones.
+    GENERATION_EPOCH.fetch_add(1, Ordering::SeqCst);
     kill_generation_processes();
 
     capture::resume_mic();
