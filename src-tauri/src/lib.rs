@@ -69,6 +69,20 @@ fn speak_batch(texts: Vec<String>, app: tauri::AppHandle) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn speak_batch_queued(
+    texts: Vec<String>,
+    final_segment: bool,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    audio::player::speak_batch_queued(texts, final_segment, app)
+}
+
+#[tauri::command]
+fn reset_tts_queue() -> Result<(), String> {
+    audio::player::reset_tts_queue()
+}
+
+#[tauri::command]
 fn stop_speaking() -> Result<(), String> {
     audio::player::stop()
 }
@@ -293,6 +307,8 @@ pub fn run() {
             load_chat_history,
             speak_text,
             speak_batch,
+            speak_batch_queued,
+            reset_tts_queue,
             stop_speaking,
             notify_tts_start,
             notify_tts_end,
