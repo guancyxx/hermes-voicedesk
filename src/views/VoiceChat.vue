@@ -14,6 +14,7 @@ import type { DebugEntry } from '../components/DebugPanel.vue'
 type VoiceState = 'idle' | 'waiting' | 'listening' | 'transcribing' | 'thinking' | 'responding' | 'speaking'
 
 interface Message {
+  id: number
   role: 'user' | 'ai'
   text: string
 }
@@ -21,6 +22,7 @@ interface Message {
 const state = ref<VoiceState>('waiting')
 const userText = ref('')
 const messages = ref<Message[]>([])
+let nextMessageId = 1
 const toolCalls = ref<ToolCall[]>([])
 const apiConnected = ref(false)
 const isListening = ref(false)
@@ -170,10 +172,8 @@ async function flushPendingSegment(final: boolean) {
   if (pendingSentences.length === 0 && !final) return
 
   const sentences = pendingSentences.splice(0)
-  if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
-    for (const sentence of sentences) {
-      messages.value[messages.value.length - 1].text += sentence
-    }
+  if (sentences.length > 0) {
+    messages.value.push({ id: nextMessageId++, role: 'ai', text: sentences.join('') })
     scrollToBottom()
   }
 
@@ -288,8 +288,8 @@ onMounted(async () => {
       sessionId: sessionId.value,
     })
     for (const turn of turns) {
-      messages.value.push({ role: 'user', text: turn.user_text })
-      messages.value.push({ role: 'ai', text: turn.ai_text })
+      messages.value.push({ id: nextMessageId++, role: 'user', text: turn.user_text })
+      messages.value.push({ id: nextMessageId++, role: 'ai', text: turn.ai_text })
     }
     if (turns.length > 0) {
       scrollToBottom()
@@ -387,7 +387,7 @@ onMounted(async () => {
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
       addDebugEntry('warning', 'STT', 'Empty or failed transcription', `raw="${text}"`)
-      messages.value.push({ role: 'ai', text: "Sorry, I didn't catch that." })
+      messages.value.push({ id: nextMessageId++, role: 'ai', text: "Sorry, I didn't catch that." })
       scrollToBottom()
       // Must stop mic and re-enter wake mode — otherwise the still-running
       // mic capture will detect more noise and loop endlessly.
@@ -413,8 +413,7 @@ onMounted(async () => {
     responseFinished = false
 
     // Add user message to chat history
-    messages.value.push({ role: 'user', text })
-    // AI placeholder pushed lazily on first hermes:delta
+    messages.value.push({ id: nextMessageId++, role: 'user', text })
     scrollToBottom()
 
     console.log(`[VoiceChat] → hermes_chat_stream: "${text}"`)
@@ -438,13 +437,8 @@ onMounted(async () => {
   })
 
   // Streaming delta — accumulate into hidden buffer, do NOT reveal in chat yet.
-  // Sentences appear in the chat bubble from speakNextInQueue() when TTS starts playing them.
+  // Each flushed segment creates its own chat bubble when TTS queues it.
   const u4 = await listen<{ content: string }>('hermes:delta', (event) => {
-    // Push AI message placeholder lazily on first delta (was empty bubble from stt:result)
-    const lastMsg = messages.value[messages.value.length - 1]
-    if (!lastMsg || lastMsg.role !== 'ai') {
-      messages.value.push({ role: 'ai', text: '' })
-    }
     state.value = 'responding'
 
     // Accumulate into the hidden full-response buffer (used for history save)
@@ -505,12 +499,28 @@ onMounted(async () => {
       sentenceBuffer.value = ''
     }
 
-    // Save this turn to history using the full response text
+    // Flush the tail before locating the current turn's final AI bubble.
+    await maybeStagedFlush(true)
+
+    // Save this turn to history using the full response text. Segment bubbles
+    // are presentation-only and do not alter the persisted turn payload.
     const msgs = messages.value
-    if (msgs.length >= 2) {
-      const lastAi = msgs[msgs.length - 1]
-      const lastUser = msgs[msgs.length - 2]
-      if (lastAi.role === 'ai' && lastUser.role === 'user') {
+    let lastAiIndex = -1
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'ai') {
+        lastAiIndex = i
+        break
+      }
+    }
+    if (lastAiIndex >= 0) {
+      let lastUser: Message | undefined
+      for (let i = lastAiIndex - 1; i >= 0; i--) {
+        if (msgs[i].role === 'user') {
+          lastUser = msgs[i]
+          break
+        }
+      }
+      if (lastUser) {
         invoke('save_chat_history', {
           sessionId: sessionId.value,
           userText: lastUser.text,
@@ -521,7 +531,6 @@ onMounted(async () => {
 
     // Enqueue the tail first, then atomically deliver the finish signal even
     // when the response ended exactly on a previous segment boundary.
-    await maybeStagedFlush(true)
     await flushPendingSegment(true)
   })
 
@@ -597,6 +606,31 @@ async function toggleListening() {
   }
 }
 
+async function startNewSession() {
+  await invoke('reset_tts_queue').catch(() => {})
+  await invoke('stop_listening').catch(() => {})
+  await invoke('stop_wake_word').catch(() => {})
+
+  isListening.value = false
+  messages.value = []
+  toolCalls.value = []
+  pendingSentences.length = 0
+  sentenceBuffer.value = ''
+  fullResponseText.value = ''
+  isTtsActive = false
+  isProcessing = false
+  responseFinished = false
+  if (stagedFlushTimer !== null) {
+    clearTimeout(stagedFlushTimer)
+    stagedFlushTimer = null
+  }
+
+  const now = new Date().toISOString()
+  sessionId.value = `voice-${now.slice(0, 10)}-${now.slice(11, 16).replace(':', '')}`
+  state.value = 'idle'
+  addDebugEntry('info', 'SESSION', 'Started new session', sessionId.value)
+}
+
 async function sendText() {
   if (!userText.value.trim()) return
 
@@ -612,8 +646,7 @@ async function sendText() {
   }
 
   // Add user message to chat history
-  messages.value.push({ role: 'user', text })
-  // AI placeholder pushed lazily on first hermes:delta
+  messages.value.push({ id: nextMessageId++, role: 'user', text })
   scrollToBottom()
 
   sentenceBuffer.value = ''
@@ -660,6 +693,7 @@ async function toggleWake() {
       <header class="chat-header">
       <StateIndicator :state="state" :api-connected="apiConnected" :wake-mode="wakeMode" :wake-keyword="wakeKeyword" />
       <div class="header-buttons">
+        <button class="btn-newchat" @click="startNewSession" title="New Session">✨</button>
         <button
           class="btn-debug"
           :class="{ active: debugVisible }"
@@ -697,8 +731,8 @@ async function toggleWake() {
       </div>
 
       <ChatBubble
-        v-for="(msg, i) in messages"
-        :key="i"
+        v-for="msg in messages"
+        :key="msg.id"
         :role="msg.role"
         :text="msg.text"
       />
@@ -818,7 +852,8 @@ async function toggleWake() {
   opacity: 0.9;
 }
 
-.btn-debug {
+.btn-debug,
+.btn-newchat {
   padding: 6px 10px;
   border-radius: 20px;
   border: 1px solid #4a4a8a;
@@ -834,7 +869,8 @@ async function toggleWake() {
   background: rgba(229, 192, 123, 0.15);
 }
 
-.btn-debug:hover {
+.btn-debug:hover,
+.btn-newchat:hover {
   opacity: 0.9;
 }
 
