@@ -297,15 +297,19 @@ fn run_tracked(cmd: &mut Command) -> io::Result<ExitStatus> {
     let epoch_at_spawn = GEN_EPOCH_AT_SPAWN.with(|e| e.get());
     let mut child = cmd.spawn()?;
     let pid = child.id();
-    // Close the race window: if a reset bumped the epoch while we were
-    // between the caller's check and this registration, the kill snapshot
-    // missed this pid — kill it right here instead.
+    // Register BEFORE checking the epoch: registration and the kill snapshot
+    // in reset_tts_queue both take GENERATION_PIDS' lock, so once we are in
+    // the table either the kill sees us (and TERMs the pid) or it happened
+    // before us and the epoch check below kills the child here. Either way
+    // the process cannot escape.
+    GENERATION_PIDS.lock().unwrap().push(pid);
     if GENERATION_EPOCH.load(Ordering::SeqCst) != epoch_at_spawn {
         let _ = child.kill();
         let _ = child.wait();
+        // Note: leave the pid in GENERATION_PIDS — if kill() itself failed
+        // (process already reaped etc.) a later reset snapshot can still TERM it.
         return Err(io::Error::new(io::ErrorKind::Other, "cancelled by reset"));
     }
-    GENERATION_PIDS.lock().unwrap().push(pid);
     let result = child.wait();
     GENERATION_PIDS
         .lock()
@@ -359,7 +363,10 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&output_path);
+        format!("Failed to run edge-tts: {}", e)
+    })?;
 
     if !status.success() {
         // Clean up any partial output — Err carries no GeneratedClip, so
@@ -394,9 +401,13 @@ fn generate_jarvis_ffmpeg(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .map_err(|e| format!("Failed to run say: {}", e))?;
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&raw_path);
+        format!("Failed to run say: {}", e)
+    })?;
 
     if !status.success() {
+        let _ = std::fs::remove_file(&raw_path);
         return Err(format!("say exited with status: {}", status));
     }
 
@@ -412,18 +423,24 @@ fn generate_jarvis_ffmpeg(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
-
-    // Clean up raw file
-    let _ = std::fs::remove_file(&raw_path);
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&raw_path);
+        let _ = std::fs::remove_file(&processed_path);
+        format!("Failed to run ffmpeg: {}", e)
+    })?;
 
     if !ffmpeg_status.success() {
-        // Fallback: use the raw file directly
+        // Fallback: use the raw file directly. Keep raw_path (it IS the clip
+        // we return) but drop any partial processed output.
+        let _ = std::fs::remove_file(&processed_path);
         return Ok(GeneratedClip {
             path: raw_path,
             is_temp: true,
         });
     }
+
+    // Clean up raw file — only after the processed output is confirmed good.
+    let _ = std::fs::remove_file(&raw_path);
 
     Ok(GeneratedClip {
         path: processed_path,
@@ -445,9 +462,13 @@ fn generate_say_direct(text: &str, voice: &str, clip_id: usize) -> Result<Genera
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .map_err(|e| format!("Failed to run say: {}", e))?;
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&output_path);
+        format!("Failed to run say: {}", e)
+    })?;
 
     if !status.success() {
+        let _ = std::fs::remove_file(&output_path);
         return Err(format!("say exited with status: {}", status));
     }
 
