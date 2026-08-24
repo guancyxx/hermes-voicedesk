@@ -131,10 +131,15 @@ function extractSentences(text: string): { sentences: string[]; remainder: strin
 
     const charBefore = match.index > 0 ? working[match.index - 1] : ''
     const afterPunct = working.substring(endIdx)
+    const nextChar = afterPunct.match(/^(\S)/)?.[1] || ''
     const nextNonSpace = afterPunct.match(/^\s*(\S)/)?.[1] || ''
 
-    // Rule 1: Don't split on digit.digit patterns (IPs like 192.168.1.1, decimals like 3.14)
-    if (/\d/.test(charBefore) && /\d/.test(nextNonSpace)) {
+    // Rule 1: Don't split decimal points or dotted identifiers.
+    // a) digit.digit — IPs (192.168.1.1), decimals (3.14)
+    // b) digit followed IMMEDIATELY (no space) by any char — 4.7-star,
+    //    3.5亿, 2.5x, 99.9%. A sentence-ending period is always followed
+    //    by whitespace; no-space means this dot is glued to the number.
+    if (/\d/.test(charBefore) && (/\d/.test(nextNonSpace) || nextChar)) {
       continue
     }
 
