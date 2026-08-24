@@ -69,8 +69,12 @@ fn speak_batch(texts: Vec<String>, app: tauri::AppHandle) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn speak_batch_queued(texts: Vec<String>, app: tauri::AppHandle) -> Result<(), String> {
-    audio::player::speak_batch_queued(texts, app)
+fn speak_batch_queued(
+    texts: Vec<String>,
+    final_segment: bool,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    audio::player::speak_batch_queued(texts, final_segment, app)
 }
 
 #[tauri::command]

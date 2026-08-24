@@ -13,10 +13,12 @@
 ///
 /// Echo prevention:
 ///   Mic is suspended BEFORE TTS begins, resumed after cooldown when TTS finishes.
+use std::collections::VecDeque;
+use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tauri::{AppHandle, Emitter};
 
@@ -25,14 +27,21 @@ use crate::audio::capture;
 /// Monotonically increasing generation counter. Incremented on every `speak()` call.
 static TTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Staged TTS segments waiting to be played in arrival order.
-static TTS_QUEUE: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+struct QueueState {
+    segments: VecDeque<Vec<String>>,
+    finished: bool,
+    active: bool,
+    round_id: u64,
+}
 
-/// Whether a queue worker currently owns the TTS start/end lifecycle.
-static QUEUE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static QUEUE: Mutex<Option<QueueState>> = Mutex::new(None);
+static QUEUE_CV: Condvar = Condvar::new();
 
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Generation processes are tracked separately from the playback child.
+static GENERATION_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// JARVIS mode: when enabled, TTS goes through the best available JARVIS voice pipeline.
 static JARVIS_MODE: AtomicBool = AtomicBool::new(true);
@@ -263,6 +272,18 @@ struct GeneratedClip {
     is_temp: bool,
 }
 
+fn run_tracked(cmd: &mut Command) -> io::Result<ExitStatus> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    GENERATION_PIDS.lock().unwrap().push(pid);
+    let result = child.wait();
+    GENERATION_PIDS
+        .lock()
+        .unwrap()
+        .retain(|tracked| *tracked != pid);
+    result
+}
+
 /// Generate audio file for a sentence using Edge-TTS.
 /// Returns path to the generated .mp3 file.
 fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
@@ -295,19 +316,20 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
         &text[..text.len().min(50)]
     );
 
-    let status = command
-        .arg("--voice")
-        .arg(&voice)
-        .arg(format!("--rate={}", rate_arg))
-        .arg(format!("--pitch={}", pitch_arg))
-        .arg("--text")
-        .arg(text)
-        .arg("--write-media")
-        .arg(&output_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
+    let status = run_tracked(
+        command
+            .arg("--voice")
+            .arg(&voice)
+            .arg(format!("--rate={}", rate_arg))
+            .arg(format!("--pitch={}", pitch_arg))
+            .arg("--text")
+            .arg(text)
+            .arg("--write-media")
+            .arg(&output_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
 
     if !status.success() {
         return Err(format!("Edge-TTS exited with status: {}", status));
@@ -329,33 +351,35 @@ fn generate_jarvis_ffmpeg(
     let processed_path = format!("/tmp/hermes_tts_jarvis_{}.aiff", clip_id);
 
     // Step 1: Generate raw audio with `say`
-    let status = Command::new("say")
-        .arg("-v")
-        .arg(voice)
-        .arg("-o")
-        .arg(&raw_path)
-        .arg(text)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to run say: {}", e))?;
+    let status = run_tracked(
+        Command::new("say")
+            .arg("-v")
+            .arg(voice)
+            .arg("-o")
+            .arg(&raw_path)
+            .arg(text)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("Failed to run say: {}", e))?;
 
     if !status.success() {
         return Err(format!("say exited with status: {}", status));
     }
 
     // Step 2: Apply JARVIS audio effects with ffmpeg
-    let ffmpeg_status = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(&raw_path)
-        .arg("-af")
-        .arg(JARVIS_FILTER)
-        .arg(&processed_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let ffmpeg_status = run_tracked(
+        Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(&raw_path)
+            .arg("-af")
+            .arg(JARVIS_FILTER)
+            .arg(&processed_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
 
     // Clean up raw file
     let _ = std::fs::remove_file(&raw_path);
@@ -378,16 +402,17 @@ fn generate_jarvis_ffmpeg(
 fn generate_say_direct(text: &str, voice: &str, clip_id: usize) -> Result<GeneratedClip, String> {
     let output_path = format!("/tmp/hermes_tts_say_{}.aiff", clip_id);
 
-    let status = Command::new("say")
-        .arg("-v")
-        .arg(voice)
-        .arg("-o")
-        .arg(&output_path)
-        .arg(text)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to run say: {}", e))?;
+    let status = run_tracked(
+        Command::new("say")
+            .arg("-v")
+            .arg(voice)
+            .arg("-o")
+            .arg(&output_path)
+            .arg(text)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("Failed to run say: {}", e))?;
 
     if !status.success() {
         return Err(format!("say exited with status: {}", status));
@@ -443,6 +468,10 @@ fn generate_clip(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
 /// normally. The parallel generation is orchestrated by the frontend which calls
 /// `speak_text` for each sentence — but we now also support a batch mode.
 pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
+    // Legacy and staged playback are mutually exclusive.
+    if queue_is_active() {
+        reset_tts_queue()?;
+    }
     // 1. Kill previous utterance
     stop_child_process();
 
@@ -595,6 +624,11 @@ fn cleanup_files(paths: &[String]) {
 /// Generate audio for multiple sentences in PARALLEL, then concatenate and play
 /// them as one file. Falls back to sequential playback if concatenation fails.
 pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
+    // Legacy and staged playback are mutually exclusive.
+    if queue_is_active() {
+        reset_tts_queue()?;
+    }
+
     if texts.is_empty() {
         return Ok(());
     }
@@ -615,7 +649,7 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
     capture::suspend_mic();
 
     std::thread::spawn(move || {
-        run_segment(texts, gen);
+        run_segment(texts, gen, &|| TTS_GENERATION.load(Ordering::SeqCst) == gen);
         finalize_tts(&app, gen);
     });
 
@@ -623,7 +657,7 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
 }
 
 /// Generate and play one segment. Returns true when a newer generation aborted it.
-fn run_segment(texts: Vec<String>, gen: u64) -> bool {
+fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> bool {
     let pid = std::process::id() as u64;
     let base_clip_id = (pid * 10000 + gen * 100) as usize;
     let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
@@ -683,7 +717,7 @@ fn run_segment(texts: Vec<String>, gen: u64) -> bool {
         }
     };
 
-    if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+    if !is_current() {
         log::info!(
             "TTS batch: generation {} superseded, aborting playback",
             gen
@@ -699,7 +733,7 @@ fn run_segment(texts: Vec<String>, gen: u64) -> bool {
     if has_ff {
         match concat_batch_clips(&generated_clips, pid, gen) {
             Ok((merged_path, temporary_paths)) => {
-                if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+                if !is_current() {
                     log::info!(
                         "TTS batch: generation {} superseded, aborting playback",
                         gen
@@ -728,7 +762,7 @@ fn run_segment(texts: Vec<String>, gen: u64) -> bool {
 
     if !played_merged {
         for (idx, clip) in generated_clips.iter().enumerate() {
-            if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+            if !is_current() {
                 log::info!(
                     "TTS batch: generation {} superseded, aborting playback",
                     gen
@@ -745,63 +779,149 @@ fn run_segment(texts: Vec<String>, gen: u64) -> bool {
     false
 }
 
-/// Queue a staged batch without interrupting the segment currently playing.
-pub fn speak_batch_queued(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
-    if texts.is_empty() {
-        return Ok(());
-    }
+fn queue_is_active() -> bool {
+    QUEUE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|state| state.active)
+}
 
-    let should_start = {
-        let mut queue = TTS_QUEUE.lock().unwrap();
-        queue.push(texts);
-        !QUEUE_ACTIVE.swap(true, Ordering::SeqCst)
+struct QueueWorkerGuard {
+    round_id: u64,
+}
+
+impl Drop for QueueWorkerGuard {
+    fn drop(&mut self) {
+        let mut queue = QUEUE.lock().unwrap();
+        if let Some(state) = queue.as_mut() {
+            if state.active && state.round_id == self.round_id {
+                state.active = false;
+                capture::notify_tts_end();
+            }
+        }
+    }
+}
+
+/// Atomically enqueue a staged segment and optionally finish the streaming round.
+pub fn speak_batch_queued(
+    texts: Vec<String>,
+    final_segment: bool,
+    app: AppHandle,
+) -> Result<(), String> {
+    let (should_start, round_id) = {
+        let mut queue = QUEUE.lock().unwrap();
+        let state = queue.get_or_insert_with(|| QueueState {
+            segments: VecDeque::new(),
+            finished: false,
+            active: false,
+            round_id: 0,
+        });
+        if !texts.is_empty() {
+            state.segments.push_back(texts);
+        }
+        if final_segment {
+            state.finished = true;
+        }
+        let should_start = !state.active;
+        if should_start {
+            state.active = true;
+        }
+        (should_start, state.round_id)
     };
-    if !should_start {
-        return Ok(());
-    }
 
-    let gen = TTS_GENERATION.load(Ordering::SeqCst);
-    capture::notify_tts_start();
-    capture::suspend_mic();
-    std::thread::spawn(move || loop {
+    if should_start {
+        capture::notify_tts_start();
+        capture::suspend_mic();
+        std::thread::spawn(move || queue_worker(app, round_id));
+    }
+    QUEUE_CV.notify_all();
+    Ok(())
+}
+
+fn queue_worker(app: AppHandle, round_id: u64) {
+    let _guard = QueueWorkerGuard { round_id };
+    loop {
         let segment = {
-            let mut queue = TTS_QUEUE.lock().unwrap();
-            if TTS_GENERATION.load(Ordering::SeqCst) != gen || !QUEUE_ACTIVE.load(Ordering::SeqCst)
-            {
+            let mut queue = QUEUE.lock().unwrap();
+            loop {
+                let state = queue.as_mut().unwrap();
+                if !state.active || state.round_id != round_id {
+                    return;
+                }
+                if let Some(segment) = state.segments.pop_front() {
+                    break Some(segment);
+                }
+                if state.finished {
+                    break None;
+                }
+                queue = QUEUE_CV
+                    .wait_timeout(queue, std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .0;
+            }
+        };
+
+        if let Some(segment) = segment {
+            if run_segment(segment, round_id, &|| {
+                QUEUE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|state| state.active && state.round_id == round_id)
+            }) {
                 return;
             }
-            if queue.is_empty() {
-                QUEUE_ACTIVE.store(false, Ordering::SeqCst);
-                None
-            } else {
-                Some(queue.remove(0))
-            }
-        };
+            continue;
+        }
 
-        let Some(segment) = segment else {
-            let _ = app.emit("tts:complete", serde_json::json!({}));
-            let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            capture::resume_mic();
-            capture::notify_tts_end();
-            return;
-        };
-
-        if run_segment(segment, gen) {
+        let current = QUEUE.lock().unwrap().as_ref().is_some_and(|state| {
+            state.active
+                && state.round_id == round_id
+                && state.finished
+                && state.segments.is_empty()
+        });
+        if !current {
             return;
         }
-    });
-    Ok(())
+        let _ = app.emit("tts:complete", serde_json::json!({}));
+        let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        capture::resume_mic();
+        let mut queue = QUEUE.lock().unwrap();
+        if let Some(state) = queue.as_mut() {
+            if state.active && state.round_id == round_id {
+                state.active = false;
+                capture::notify_tts_end();
+            }
+        }
+        return;
+    }
 }
 
 /// Clear all staged speech and invalidate the active queue worker.
 pub fn reset_tts_queue() -> Result<(), String> {
-    TTS_GENERATION.fetch_add(1, Ordering::SeqCst);
-    TTS_QUEUE.lock().unwrap().clear();
+    let was_active = {
+        let mut queue = QUEUE.lock().unwrap();
+        let state = queue.get_or_insert_with(|| QueueState {
+            segments: VecDeque::new(),
+            finished: false,
+            active: false,
+            round_id: 0,
+        });
+        let was_active = state.active;
+        state.round_id = state.round_id.wrapping_add(1);
+        state.segments.clear();
+        state.finished = true;
+        state.active = false;
+        was_active
+    };
+    QUEUE_CV.notify_all();
     stop_child_process();
+    kill_generation_processes();
 
     capture::resume_mic();
-    if QUEUE_ACTIVE.swap(false, Ordering::SeqCst) {
+    if was_active {
         capture::notify_tts_end();
     }
     Ok(())
@@ -854,15 +974,19 @@ fn stop_child_process() {
     }
 }
 
+fn kill_generation_processes() {
+    let pids = GENERATION_PIDS.lock().unwrap().clone();
+    for pid in pids {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
 /// Stop current speech immediately.
 /// Called when the user interrupts or a new response arrives.
 pub fn stop() -> Result<(), String> {
-    reset_tts_queue()?;
-
-    // Safety net: kill any stray `say`, `afplay`, or `edge-tts` processes
-    let _ = Command::new("killall").arg("say").output();
-    let _ = Command::new("killall").arg("afplay").output();
-    let _ = Command::new("killall").arg("edge-tts").output();
-
-    Ok(())
+    // `stop` also cancels legacy speak/speak_batch generations; queue resets do not.
+    TTS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    reset_tts_queue()
 }

@@ -166,8 +166,8 @@ function enqueueSentence(sentence: string) {
   pendingSentences.push(trimmed)
 }
 
-function flushPendingSegment() {
-  if (pendingSentences.length === 0) return
+async function flushPendingSegment(final: boolean) {
+  if (pendingSentences.length === 0 && !final) return
 
   const sentences = pendingSentences.splice(0)
   if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'ai') {
@@ -178,15 +178,17 @@ function flushPendingSegment() {
   }
 
   addDebugEntry('info', 'TTS', `Queueing staged TTS segment with ${sentences.length} sentences`)
-  invoke('speak_batch_queued', { texts: sentences }).catch((e) => {
+  try {
+    await invoke('speak_batch_queued', { texts: sentences, finalSegment: final })
+  } catch (e) {
     console.error('speak_batch_queued failed:', e)
     addDebugEntry('error', 'TTS', 'speak_batch_queued failed', String(e))
     isTtsActive = false
-    enterWakeMode()
-  })
+    await invoke('reset_tts_queue').catch(() => {})
+  }
 }
 
-function startBatchTTS() {
+async function startBatchTTS() {
   if (pendingSentences.length === 0) {
     if (responseFinished && !isTtsActive) enterWakeMode()
     return
@@ -194,10 +196,10 @@ function startBatchTTS() {
 
   isTtsActive = true
   state.value = 'speaking'
-  flushPendingSegment()
+  await flushPendingSegment(false)
 }
 
-function maybeStagedFlush(force: boolean) {
+async function maybeStagedFlush(force: boolean) {
   const silenceElapsed = pendingSentences.length > 0
     && Date.now() - lastDeltaAt >= STAGED_TTS_SILENCE_MS
   if (!force && pendingSentences.length < STAGED_TTS_SEGMENT_SIZE && !silenceElapsed) {
@@ -208,7 +210,15 @@ function maybeStagedFlush(force: boolean) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
   }
-  startBatchTTS()
+  if (force) {
+    if (pendingSentences.length > 0) {
+      isTtsActive = true
+      state.value = 'speaking'
+      await flushPendingSegment(false)
+    }
+    return
+  }
+  await startBatchTTS()
 }
 
 function scrollToBottom() {
@@ -452,9 +462,9 @@ onMounted(async () => {
     if (stagedFlushTimer !== null) clearTimeout(stagedFlushTimer)
     stagedFlushTimer = setTimeout(() => {
       stagedFlushTimer = null
-      maybeStagedFlush(false)
+      void maybeStagedFlush(false)
     }, STAGED_TTS_SILENCE_MS)
-    maybeStagedFlush(false)
+    void maybeStagedFlush(false)
     scrollToBottom()
   })
 
@@ -475,7 +485,7 @@ onMounted(async () => {
     }
   })
 
-  const u6 = await listen('hermes:finish', () => {
+  const u6 = await listen('hermes:finish', async () => {
     responseFinished = true
     if (stagedFlushTimer !== null) {
       clearTimeout(stagedFlushTimer)
@@ -509,7 +519,10 @@ onMounted(async () => {
       }
     }
 
-    maybeStagedFlush(true)
+    // Enqueue the tail first, then atomically deliver the finish signal even
+    // when the response ended exactly on a previous segment boundary.
+    await maybeStagedFlush(true)
+    await flushPendingSegment(true)
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
@@ -519,6 +532,11 @@ onMounted(async () => {
       lastMsg.text += `\n\nError: ${event.payload.error}`
     }
     responseFinished = true
+    if (stagedFlushTimer !== null) {
+      clearTimeout(stagedFlushTimer)
+      stagedFlushTimer = null
+    }
+    invoke('reset_tts_queue').catch(() => {})
     enterWakeMode()
   })
 
@@ -533,7 +551,7 @@ onMounted(async () => {
     if (responseFinished) {
       enterWakeMode()
     } else {
-      state.value = 'responding'
+      scrollToBottom()
     }
   })
 
@@ -552,6 +570,10 @@ onUnmounted(() => {
 async function startListening() {
   console.log('[VoiceChat] startListening')
   addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
+  if (stagedFlushTimer !== null) {
+    clearTimeout(stagedFlushTimer)
+    stagedFlushTimer = null
+  }
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   pendingSentences.length = 0
