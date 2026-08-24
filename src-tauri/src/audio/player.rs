@@ -523,7 +523,7 @@ fn concat_batch_clips(
             .arg("-y")
             .arg("-i")
             .arg(&clip.path)
-            .args(["-ar", "44100", "-ac", "2"])
+            .args(["-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"])
             .arg(&normalized_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -692,6 +692,7 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
                 gen
             );
             cleanup_originals();
+            finalize_tts(&app, gen);
             return;
         }
 
@@ -712,10 +713,13 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
                         );
                         cleanup_files(&temporary_paths);
                         cleanup_originals();
+                        finalize_tts(&app, gen);
                         return;
                     }
                     if let Err(e) = play_file(&merged_path) {
                         log::error!("TTS merged playback error: {}", e);
+                    } else {
+                        played_merged = true;
                     }
                     for path in temporary_paths {
                         let _ = std::fs::remove_file(path);
@@ -775,6 +779,10 @@ fn play_file(path: &str) -> Result<(), String> {
 }
 
 /// Finalize TTS: emit completion events and resume mic.
+/// The notify_tts_end() counter decrement must happen on EVERY exit path —
+/// including when this generation was superseded — otherwise TTS_PLAYING_COUNT
+/// leaks upward and the mic stays suppressed forever. Only the user-facing
+/// events (tts:complete / audio:state) are gated on the generation check.
 fn finalize_tts(app: &AppHandle, gen: u64) {
     if TTS_GENERATION.load(Ordering::SeqCst) == gen {
         let _ = app.emit("tts:complete", serde_json::json!({}));
@@ -784,8 +792,8 @@ fn finalize_tts(app: &AppHandle, gen: u64) {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         capture::resume_mic();
-        capture::notify_tts_end();
     }
+    capture::notify_tts_end();
 }
 
 // ── Stop ─────────────────────────────────────────────────────────────────────
