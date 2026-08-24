@@ -207,6 +207,14 @@ function scrollToBottom() {
           chatArea.value.scrollTop = chatArea.value.scrollHeight
         }
       })
+      // Final safety net for large one-shot DOM updates (batch reveal of dozens
+      // of sentences + lazily-rendered tool cards can keep growing scrollHeight
+      // for a few hundred ms after layout).
+      setTimeout(() => {
+        if (chatArea.value) {
+          chatArea.value.scrollTop = chatArea.value.scrollHeight
+        }
+      }, 300)
     }
   })
 }
@@ -491,6 +499,9 @@ onMounted(async () => {
     addDebugEntry('info', 'TTS', 'TTS batch complete — all sentences played')
     isTtsActive = false
     lastTtsCompleteAt = Date.now()
+    // Pin chat to the latest content after playback finishes — the user must
+    // end up looking at the final reply, not somewhere mid-history.
+    scrollToBottom()
     enterWakeMode()
   })
 
