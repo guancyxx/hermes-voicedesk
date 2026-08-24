@@ -87,8 +87,8 @@ fn pick_edge_tts_voice(text: &str) -> String {
 
 /// Edge-TTS binary paths to try (in order).
 const EDGE_TTS_PATHS: &[&str] = &[
-    "edge-tts",                                                     // In PATH
-    "/opt/homebrew/bin/edge-tts",                                   // Homebrew
+    "edge-tts",                   // In PATH
+    "/opt/homebrew/bin/edge-tts", // Homebrew
 ];
 
 /// Find the edge-tts binary, trying multiple paths and `python3 -m edge_tts`.
@@ -282,7 +282,10 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
 
     log::debug!(
         "Edge-TTS: voice={} rate={} pitch={} is_zh={} text=\"{}\"",
-        voice, rate_arg, pitch_arg, is_zh,
+        voice,
+        rate_arg,
+        pitch_arg,
+        is_zh,
         &text[..text.len().min(50)]
     );
 
@@ -311,7 +314,11 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
 }
 
 /// Generate audio file using macOS say + ffmpeg JARVIS filter.
-fn generate_jarvis_ffmpeg(text: &str, voice: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+fn generate_jarvis_ffmpeg(
+    text: &str,
+    voice: &str,
+    clip_id: usize,
+) -> Result<GeneratedClip, String> {
     let raw_path = format!("/tmp/hermes_tts_raw_{}.aiff", clip_id);
     let processed_path = format!("/tmp/hermes_tts_jarvis_{}.aiff", clip_id);
 
@@ -395,7 +402,11 @@ fn generate_clip(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
         match generate_edgetts(text, clip_id) {
             Ok(clip) => return Ok(clip),
             Err(e) => {
-                log::warn!("Edge-TTS generation failed for clip {}: {}, falling back", clip_id, e);
+                log::warn!(
+                    "Edge-TTS generation failed for clip {}: {}, falling back",
+                    clip_id,
+                    e
+                );
             }
         }
     }
@@ -406,7 +417,11 @@ fn generate_clip(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
         match generate_jarvis_ffmpeg(text, &voice, clip_id) {
             Ok(clip) => return Ok(clip),
             Err(e) => {
-                log::warn!("JARVIS ffmpeg generation failed for clip {}: {}, falling back to say", clip_id, e);
+                log::warn!(
+                    "JARVIS ffmpeg generation failed for clip {}: {}, falling back to say",
+                    clip_id,
+                    e
+                );
             }
         }
     }
@@ -487,9 +502,92 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Generate audio for multiple sentences in PARALLEL, then play them sequentially.
-/// All generation threads run simultaneously. Playback starts only after ALL
-/// clips have been generated.
+/// Normalize and concatenate batch clips into one WAV file.
+///
+/// Returns the merged path plus every intermediate file that must be cleaned up.
+fn concat_batch_clips(
+    clips: &[&GeneratedClip],
+    pid: u64,
+    gen: u64,
+) -> Result<(String, Vec<String>), String> {
+    let prefix = format!("/tmp/hermes_tts_batch_{}_{}", pid, gen);
+    let list_path = format!("{}_concat.txt", prefix);
+    let merged_path = format!("{}_merged.wav", prefix);
+    let mut temporary_paths = Vec::with_capacity(clips.len() + 2);
+
+    for (idx, clip) in clips.iter().enumerate() {
+        let normalized_path = format!("{}_norm_{}.wav", prefix, idx);
+        temporary_paths.push(normalized_path.clone());
+
+        let status = match Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(&clip.path)
+            .args(["-ar", "44100", "-ac", "2"])
+            .arg(&normalized_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) => status,
+            Err(e) => {
+                cleanup_files(&temporary_paths);
+                return Err(format!("failed to normalize clip {}: {}", idx, e));
+            }
+        };
+
+        if !status.success() {
+            cleanup_files(&temporary_paths);
+            return Err(format!(
+                "ffmpeg normalization failed for clip {} with status {}",
+                idx, status
+            ));
+        }
+    }
+
+    let concat_list = temporary_paths
+        .iter()
+        .map(|path| format!("file '{}'\n", path.replace('\'', "'\\''")))
+        .collect::<String>();
+    if let Err(e) = std::fs::write(&list_path, concat_list) {
+        cleanup_files(&temporary_paths);
+        return Err(format!("failed to write concat list: {}", e));
+    }
+    temporary_paths.push(list_path.clone());
+    temporary_paths.push(merged_path.clone());
+
+    let status = match Command::new("ffmpeg")
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(&merged_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) => status,
+        Err(e) => {
+            cleanup_files(&temporary_paths);
+            return Err(format!("failed to run ffmpeg concat: {}", e));
+        }
+    };
+
+    if !status.success() {
+        cleanup_files(&temporary_paths);
+        return Err(format!("ffmpeg concat failed with status {}", status));
+    }
+
+    Ok((merged_path, temporary_paths))
+}
+
+fn cleanup_files(paths: &[String]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Generate audio for multiple sentences in PARALLEL, then concatenate and play
+/// them as one file. Falls back to sequential playback if concatenation fails.
 pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
     if texts.is_empty() {
         return Ok(());
@@ -520,8 +618,11 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
 
         // ── PARALLEL GENERATION ──
         // Spawn one thread per sentence to generate audio simultaneously
-        let results: Arc<Mutex<Vec<Result<GeneratedClip, String>>>> =
-            Arc::new(Mutex::new((0..texts.len()).map(|_| Err("pending".to_string())).collect()));
+        let results: Arc<Mutex<Vec<Result<GeneratedClip, String>>>> = Arc::new(Mutex::new(
+            (0..texts.len())
+                .map(|_| Err("pending".to_string()))
+                .collect(),
+        ));
 
         let mut handles = Vec::new();
 
@@ -565,44 +666,88 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
             let _ = handle.join();
         }
 
-        log::info!(
-            "TTS batch: all {} clips generated in parallel, starting sequential playback",
-            texts.len()
-        );
+        log::info!("TTS batch: all {} clips generated in parallel", texts.len());
 
-        // ── SEQUENTIAL PLAYBACK ──
         let clips = results.lock().unwrap();
-        for (idx, clip_result) in clips.iter().enumerate() {
-            // Check if this generation is still current
-            if TTS_GENERATION.load(Ordering::SeqCst) != gen {
-                log::info!("TTS batch: generation {} superseded, aborting playback", gen);
-                // Clean up any remaining clips
-                for (cleanup_idx, clip_result) in clips.iter().enumerate() {
-                    if cleanup_idx >= idx {
-                        if let Ok(clip) = clip_result {
-                            if clip.is_temp {
-                                let _ = std::fs::remove_file(&clip.path);
-                            }
-                        }
-                    }
-                }
-                return;
+        let mut generated_clips = Vec::new();
+        for (idx, result) in clips.iter().enumerate() {
+            match result {
+                Ok(clip) => generated_clips.push(clip),
+                Err(e) => log::warn!("TTS generation failed for clip {}: {}", idx, e),
             }
+        }
 
-            match clip_result {
-                Ok(clip) => {
-                    if let Err(e) = play_file(&clip.path) {
-                        log::error!("TTS playback error for clip {}: {}", idx, e);
-                    }
-                    if clip.is_temp {
-                        let _ = std::fs::remove_file(&clip.path);
-                    }
+        let cleanup_originals = || {
+            for clip in &generated_clips {
+                if clip.is_temp {
+                    let _ = std::fs::remove_file(&clip.path);
                 }
-                Err(e) => {
-                    log::error!("TTS generation failed for clip {}: {}", idx, e);
+            }
+        };
+
+        // Check after all generation work and immediately before playback.
+        if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+            log::info!(
+                "TTS batch: generation {} superseded, aborting playback",
+                gen
+            );
+            cleanup_originals();
+            return;
+        }
+
+        if generated_clips.is_empty() {
+            finalize_tts(&app, gen);
+            return;
+        }
+
+        // ── CONCATENATED PLAYBACK ──
+        let mut played_merged = false;
+        if has_ff {
+            match concat_batch_clips(&generated_clips, pid, gen) {
+                Ok((merged_path, temporary_paths)) => {
+                    if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+                        log::info!(
+                            "TTS batch: generation {} superseded, aborting playback",
+                            gen
+                        );
+                        cleanup_files(&temporary_paths);
+                        cleanup_originals();
+                        return;
+                    }
+                    if let Err(e) = play_file(&merged_path) {
+                        log::error!("TTS merged playback error: {}", e);
+                    }
+                    for path in temporary_paths {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    played_merged = true;
+                }
+                Err(e) => log::warn!(
+                    "TTS batch concat failed, falling back to sequential playback: {}",
+                    e
+                ),
+            }
+        } else {
+            log::warn!("TTS batch concat unavailable: ffmpeg not found; falling back to sequential playback");
+        }
+
+        // ── SEQUENTIAL FALLBACK ──
+        if !played_merged {
+            for (idx, clip) in generated_clips.iter().enumerate() {
+                if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+                    log::info!(
+                        "TTS batch: generation {} superseded, aborting playback",
+                        gen
+                    );
+                    break;
+                }
+                if let Err(e) = play_file(&clip.path) {
+                    log::error!("TTS playback error for clip {}: {}", idx, e);
                 }
             }
         }
+
+        cleanup_originals();
 
         finalize_tts(&app, gen);
     });
