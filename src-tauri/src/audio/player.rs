@@ -724,7 +724,6 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
                     for path in temporary_paths {
                         let _ = std::fs::remove_file(path);
                     }
-                    played_merged = true;
                 }
                 Err(e) => log::warn!(
                     "TTS batch concat failed, falling back to sequential playback: {}",
