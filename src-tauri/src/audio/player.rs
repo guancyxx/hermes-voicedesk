@@ -7,15 +7,16 @@
 ///    audio post-processing via ffmpeg filters.
 /// 3. **macOS say direct** — Last resort, no dependencies.
 ///
+/// **Parallel generation**: All sentences are TTS-generated in parallel (each on
+/// its own thread). Playback starts only after ALL sentences have finished
+/// generating, then plays them back in order.
+///
 /// Echo prevention:
 ///   Mic is suspended BEFORE TTS begins, resumed after cooldown when TTS finishes.
-///
-/// Queue management:
-///   Only ONE utterance runs at a time. Starting new speech kills the previous one.
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
 
@@ -33,8 +34,54 @@ static JARVIS_MODE: AtomicBool = AtomicBool::new(true);
 /// Current macOS voice name (default: Daniel — British male, JARVIS-like fallback).
 static VOICE_NAME: Mutex<String> = Mutex::new(String::new());
 
-/// Edge-TTS voice name for JARVIS mode.
+/// Edge-TTS voice name for JARVIS mode (English).
 static EDGE_TTS_VOICE: Mutex<String> = Mutex::new(String::new());
+
+/// Edge-TTS voice name for Chinese content.
+static EDGE_TTS_VOICE_ZH: Mutex<String> = Mutex::new(String::new());
+
+/// Detect whether text is predominantly Chinese (CJK characters).
+/// Returns true if >30% of alphanumeric characters are CJK.
+fn is_chinese_text(text: &str) -> bool {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            continue;
+        }
+        if ('\u{4E00}'..='\u{9FFF}').contains(&ch) {
+            cjk += 1;
+        } else if ch.is_alphanumeric() {
+            other += 1;
+        }
+    }
+    let total = cjk + other;
+    if total == 0 {
+        return false;
+    }
+    cjk as f64 / total as f64 > 0.3
+}
+
+/// Pick the appropriate edge-tts voice based on text language.
+/// - Chinese text → zh-CN male voice (JARVIS-like: YunyangNeural or YunxiNeural)
+/// - English/other → en-GB-RyanNeural (British butler)
+fn pick_edge_tts_voice(text: &str) -> String {
+    if is_chinese_text(text) {
+        let voice = EDGE_TTS_VOICE_ZH.lock().unwrap();
+        if !voice.is_empty() {
+            return voice.clone();
+        }
+        // zh-CN-YunyangNeural: professional, reliable male — most JARVIS-like for Chinese
+        // zh-CN-YunxiNeural: lively, sunshine male — warmer alternative
+        "zh-CN-YunyangNeural".to_string()
+    } else {
+        let voice = EDGE_TTS_VOICE.lock().unwrap();
+        if !voice.is_empty() {
+            return voice.clone();
+        }
+        "en-GB-RyanNeural".to_string()
+    }
+}
 
 // ── Edge-TTS ─────────────────────────────────────────────────────────────────
 
@@ -118,6 +165,20 @@ fn get_voice() -> String {
     }
 }
 
+/// Pick the macOS `say` voice based on text language.
+/// - Chinese text → Tingting (zh_CN female) or a male zh_CN voice if available
+/// - English/other → the configured VOICE_NAME (default: Daniel)
+fn get_voice_for_text(text: &str) -> String {
+    if is_chinese_text(text) {
+        // Try male Chinese voices first, fall back to Tingting
+        // macOS 26+ has new voices like Reed, Rocko (zh_CN male)
+        // Tingting is the classic always-available zh_CN voice
+        "Tingting".to_string()
+    } else {
+        get_voice()
+    }
+}
+
 // ── FFmpeg ───────────────────────────────────────────────────────────────────
 
 /// Enhanced JARVIS ffmpeg audio filter chain.
@@ -186,76 +247,22 @@ pub fn get_tts_provider() -> &'static str {
     }
 }
 
-// ── Core speak pipeline ──────────────────────────────────────────────────────
+// ── Audio generation (produces a playable file, no playback) ────────────────
 
-/// Speak text using the best available TTS pipeline.
-///
-/// Priority:
-/// 1. JARVIS mode + edge-tts available → Edge-TTS en-GB-RyanNeural
-/// 2. JARVIS mode + ffmpeg available → say + JARVIS ffmpeg filter
-/// 3. Normal mode → say direct (with optional JARVIS ffmpeg if enabled)
-pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
-    // 1. Kill previous utterance
-    stop_child_process();
-
-    // 2. Bump generation counter — invalidates pending callbacks
-    let gen = TTS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-
-    // 3. Signal TTS-start and suspend mic
-    capture::notify_tts_start();
-    capture::suspend_mic();
-
-    let text_owned = text.to_string();
-    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
-
-    std::thread::spawn(move || {
-        let result = if use_jarvis && has_edge_tts() {
-            // Best: Edge-TTS with JARVIS voice
-            speak_with_edgetts(&text_owned)
-        } else if use_jarvis && has_ffmpeg() {
-            // Fallback: macOS say + ffmpeg JARVIS filters
-            let voice = get_voice();
-            speak_with_jarvis_ffmpeg(&text_owned, &voice)
-        } else {
-            // Direct: macOS say (no processing)
-            let voice = get_voice();
-            speak_direct(&text_owned, &voice)
-        };
-
-        if let Err(ref e) = result {
-            log::error!("TTS error: {}", e);
-        }
-
-        // Only finalize if this generation is still current
-        if TTS_GENERATION.load(Ordering::SeqCst) == gen {
-            let _ = app.emit("tts:complete", serde_json::json!({}));
-            let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
-
-            // Brief cooldown for residual echo before re-enabling mic
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            capture::resume_mic();
-            capture::notify_tts_end();
-        }
-    });
-
-    Ok(())
+/// Result of generating audio for one sentence.
+struct GeneratedClip {
+    /// Path to the generated audio file
+    path: String,
+    /// True if the file should be deleted after playback
+    is_temp: bool,
 }
 
-// ── Edge-TTS pipeline ────────────────────────────────────────────────────────
-
-/// Speak using Edge-TTS for the best JARVIS-like British AI butler voice.
-///
-/// Pipeline:
-///   edge-tts --voice en-GB-RyanNeural --text "..." --write-media /tmp/tts.mp3
-///   → afplay /tmp/tts.mp3
-fn speak_with_edgetts(text: &str) -> Result<(), String> {
-    let pid = std::process::id();
-    let output_path = format!("/tmp/hermes_tts_edgetts_{}.mp3", pid);
-    let voice = get_edge_tts_voice();
-
-    // Edge-TTS supports --rate and --pitch for JARVIS-like adjustments
-    // Slightly slower rate (-5%) and lower pitch (-3Hz) for measured butler delivery
+/// Generate audio file for a sentence using Edge-TTS.
+/// Returns path to the generated .mp3 file.
+fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+    let output_path = format!("/tmp/hermes_tts_clip_{}.mp3", clip_id);
+    let voice = pick_edge_tts_voice(text);
+    let is_zh = is_chinese_text(text);
     let cmd = edge_tts_cmd();
 
     let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -268,11 +275,22 @@ fn speak_with_edgetts(text: &str) -> Result<(), String> {
         Command::new(&cmd)
     };
 
+    // Chinese voices sound better at near-normal rate/pitch.
+    // English uses the JARVIS butler adjustments (-5% rate, -3Hz pitch).
+    let rate_arg = if is_zh { "+0%" } else { "-5%" };
+    let pitch_arg = if is_zh { "+0Hz" } else { "-3Hz" };
+
+    log::debug!(
+        "Edge-TTS: voice={} rate={} pitch={} is_zh={} text=\"{}\"",
+        voice, rate_arg, pitch_arg, is_zh,
+        &text[..text.len().min(50)]
+    );
+
     let status = command
         .arg("--voice")
         .arg(&voice)
-        .arg("--rate=-5%")
-        .arg("--pitch=-3Hz")
+        .arg(format!("--rate={}", rate_arg))
+        .arg(format!("--pitch={}", pitch_arg))
         .arg("--text")
         .arg(text)
         .arg("--write-media")
@@ -283,65 +301,19 @@ fn speak_with_edgetts(text: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to run edge-tts: {}", e))?;
 
     if !status.success() {
-        // Edge-TTS failed — fall back to say + ffmpeg
-        log::warn!("Edge-TTS failed, falling back to macOS say + ffmpeg");
-        let voice = get_voice();
-        if has_ffmpeg() {
-            return speak_with_jarvis_ffmpeg(text, &voice);
-        } else {
-            return speak_direct(text, &voice);
-        }
+        return Err(format!("Edge-TTS exited with status: {}", status));
     }
 
-    // Play with afplay
-    let child = Command::new("afplay")
-        .arg(&output_path)
-        .spawn()
-        .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
-
-    *CURRENT_CHILD.lock().unwrap() = Some(child);
-
-    if let Some(mut child_to_wait) = CURRENT_CHILD.lock().unwrap().take() {
-        child_to_wait
-            .wait()
-            .map_err(|e| format!("afplay process error: {}", e))?;
-    }
-
-    // Clean up
-    let _ = std::fs::remove_file(&output_path);
-
-    Ok(())
+    Ok(GeneratedClip {
+        path: output_path,
+        is_temp: true,
+    })
 }
 
-// ── macOS say (direct) ───────────────────────────────────────────────────────
-
-/// Direct playback: `say -v <voice> <text>` (no post-processing).
-fn speak_direct(text: &str, voice: &str) -> Result<(), String> {
-    let child = Command::new("say")
-        .arg("-v")
-        .arg(voice)
-        .arg(text)
-        .spawn()
-        .map_err(|e| format!("Failed to spawn say: {}", e))?;
-
-    *CURRENT_CHILD.lock().unwrap() = Some(child);
-
-    if let Some(mut child_to_wait) = CURRENT_CHILD.lock().unwrap().take() {
-        child_to_wait
-            .wait()
-            .map_err(|e| format!("say process error: {}", e))?;
-    }
-
-    Ok(())
-}
-
-// ── macOS say + ffmpeg JARVIS filter (fallback) ──────────────────────────────
-
-/// JARVIS pipeline: say → raw aiff → ffmpeg → processed aiff → afplay.
-fn speak_with_jarvis_ffmpeg(text: &str, voice: &str) -> Result<(), String> {
-    let pid = std::process::id();
-    let raw_path = format!("/tmp/hermes_tts_raw_{}.aiff", pid);
-    let processed_path = format!("/tmp/hermes_tts_jarvis_{}.aiff", pid);
+/// Generate audio file using macOS say + ffmpeg JARVIS filter.
+fn generate_jarvis_ffmpeg(text: &str, voice: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+    let raw_path = format!("/tmp/hermes_tts_raw_{}.aiff", clip_id);
+    let processed_path = format!("/tmp/hermes_tts_jarvis_{}.aiff", clip_id);
 
     // Step 1: Generate raw audio with `say`
     let status = Command::new("say")
@@ -350,6 +322,8 @@ fn speak_with_jarvis_ffmpeg(text: &str, voice: &str) -> Result<(), String> {
         .arg("-o")
         .arg(&raw_path)
         .arg(text)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("Failed to run say: {}", e))?;
 
@@ -370,17 +344,277 @@ fn speak_with_jarvis_ffmpeg(text: &str, voice: &str) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
 
-    // Clean up raw file immediately
+    // Clean up raw file
     let _ = std::fs::remove_file(&raw_path);
 
     if !ffmpeg_status.success() {
-        log::warn!("ffmpeg processing failed, falling back to direct say");
-        return speak_direct(text, voice);
+        // Fallback: use the raw file directly
+        return Ok(GeneratedClip {
+            path: raw_path,
+            is_temp: true,
+        });
     }
 
-    // Step 3: Play processed audio with afplay
+    Ok(GeneratedClip {
+        path: processed_path,
+        is_temp: true,
+    })
+}
+
+/// Generate audio file using macOS say directly (no processing).
+fn generate_say_direct(text: &str, voice: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+    let output_path = format!("/tmp/hermes_tts_say_{}.aiff", clip_id);
+
+    let status = Command::new("say")
+        .arg("-v")
+        .arg(voice)
+        .arg("-o")
+        .arg(&output_path)
+        .arg(text)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run say: {}", e))?;
+
+    if !status.success() {
+        return Err(format!("say exited with status: {}", status));
+    }
+
+    Ok(GeneratedClip {
+        path: output_path,
+        is_temp: true,
+    })
+}
+
+/// Generate audio for a single sentence using the best available pipeline.
+/// Does NOT play — only produces the file.
+fn generate_clip(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
+
+    if use_jarvis && has_edge_tts() {
+        match generate_edgetts(text, clip_id) {
+            Ok(clip) => return Ok(clip),
+            Err(e) => {
+                log::warn!("Edge-TTS generation failed for clip {}: {}, falling back", clip_id, e);
+            }
+        }
+    }
+
+    let voice = get_voice_for_text(text);
+
+    if use_jarvis && has_ffmpeg() {
+        match generate_jarvis_ffmpeg(text, &voice, clip_id) {
+            Ok(clip) => return Ok(clip),
+            Err(e) => {
+                log::warn!("JARVIS ffmpeg generation failed for clip {}: {}, falling back to say", clip_id, e);
+            }
+        }
+    }
+
+    generate_say_direct(text, &voice, clip_id)
+}
+
+// ── Core speak pipeline (parallel generation, sequential playback) ──────────
+
+/// Speak text using the best available TTS pipeline.
+///
+/// **Parallel mode**: When a single sentence is requested, generates and plays
+/// normally. The parallel generation is orchestrated by the frontend which calls
+/// `speak_text` for each sentence — but we now also support a batch mode.
+pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
+    // 1. Kill previous utterance
+    stop_child_process();
+
+    // 2. Bump generation counter — invalidates pending callbacks
+    let gen = TTS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // 3. Signal TTS-start and suspend mic
+    capture::notify_tts_start();
+    capture::suspend_mic();
+
+    let text_owned = text.to_string();
+    let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
+
+    std::thread::spawn(move || {
+        // Generate audio file
+        let pid = std::process::id() as u64;
+        let clip_id = (pid * 1000 + gen) as usize;
+
+        let clip_result = {
+            if use_jarvis && has_edge_tts() {
+                match generate_edgetts(&text_owned, clip_id) {
+                    Ok(c) => Ok(c),
+                    Err(_) => {
+                        let voice = get_voice_for_text(&text_owned);
+                        if has_ffmpeg() {
+                            generate_jarvis_ffmpeg(&text_owned, &voice, clip_id)
+                        } else {
+                            generate_say_direct(&text_owned, &voice, clip_id)
+                        }
+                    }
+                }
+            } else {
+                let voice = get_voice_for_text(&text_owned);
+                if use_jarvis && has_ffmpeg() {
+                    generate_jarvis_ffmpeg(&text_owned, &voice, clip_id)
+                } else {
+                    generate_say_direct(&text_owned, &voice, clip_id)
+                }
+            }
+        };
+
+        let clip = match clip_result {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("TTS generation error: {}", e);
+                finalize_tts(&app, gen);
+                return;
+            }
+        };
+
+        // Play the generated audio file
+        if let Err(e) = play_file(&clip.path) {
+            log::error!("TTS playback error: {}", e);
+        }
+
+        if clip.is_temp {
+            let _ = std::fs::remove_file(&clip.path);
+        }
+
+        finalize_tts(&app, gen);
+    });
+
+    Ok(())
+}
+
+/// Generate audio for multiple sentences in PARALLEL, then play them sequentially.
+/// All generation threads run simultaneously. Playback starts only after ALL
+/// clips have been generated.
+pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
+    if texts.is_empty() {
+        return Ok(());
+    }
+
+    // Single sentence — just use regular speak()
+    if texts.len() == 1 {
+        return speak(&texts[0], app);
+    }
+
+    // 1. Kill previous utterance
+    stop_child_process();
+
+    // 2. Bump generation counter
+    let gen = TTS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // 3. Signal TTS-start and suspend mic
+    capture::notify_tts_start();
+    capture::suspend_mic();
+
+    let pid = std::process::id() as u64;
+    let base_clip_id = (pid * 10000 + gen * 100) as usize;
+
+    std::thread::spawn(move || {
+        let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
+        let has_et = has_edge_tts();
+        let has_ff = has_ffmpeg();
+
+        // ── PARALLEL GENERATION ──
+        // Spawn one thread per sentence to generate audio simultaneously
+        let results: Arc<Mutex<Vec<Result<GeneratedClip, String>>>> =
+            Arc::new(Mutex::new((0..texts.len()).map(|_| Err("pending".to_string())).collect()));
+
+        let mut handles = Vec::new();
+
+        for (idx, text) in texts.iter().enumerate() {
+            let results = results.clone();
+            let text = text.clone();
+            let clip_id = base_clip_id + idx;
+            let use_jarvis = use_jarvis;
+            let has_et = has_et;
+            let has_ff = has_ff;
+            // Per-sentence voice selection (Chinese sentences get Chinese voice)
+            let voice = get_voice_for_text(&text);
+
+            let handle = std::thread::spawn(move || {
+                let clip_result = if use_jarvis && has_et {
+                    match generate_edgetts(&text, clip_id) {
+                        Ok(c) => Ok(c),
+                        Err(_) => {
+                            if has_ff {
+                                generate_jarvis_ffmpeg(&text, &voice, clip_id)
+                            } else {
+                                generate_say_direct(&text, &voice, clip_id)
+                            }
+                        }
+                    }
+                } else if use_jarvis && has_ff {
+                    generate_jarvis_ffmpeg(&text, &voice, clip_id)
+                } else {
+                    generate_say_direct(&text, &voice, clip_id)
+                };
+
+                if let Ok(mut guard) = results.lock() {
+                    guard[idx] = clip_result;
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for ALL generation threads to complete
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        log::info!(
+            "TTS batch: all {} clips generated in parallel, starting sequential playback",
+            texts.len()
+        );
+
+        // ── SEQUENTIAL PLAYBACK ──
+        let clips = results.lock().unwrap();
+        for (idx, clip_result) in clips.iter().enumerate() {
+            // Check if this generation is still current
+            if TTS_GENERATION.load(Ordering::SeqCst) != gen {
+                log::info!("TTS batch: generation {} superseded, aborting playback", gen);
+                // Clean up any remaining clips
+                for (cleanup_idx, clip_result) in clips.iter().enumerate() {
+                    if cleanup_idx >= idx {
+                        if let Ok(clip) = clip_result {
+                            if clip.is_temp {
+                                let _ = std::fs::remove_file(&clip.path);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            match clip_result {
+                Ok(clip) => {
+                    if let Err(e) = play_file(&clip.path) {
+                        log::error!("TTS playback error for clip {}: {}", idx, e);
+                    }
+                    if clip.is_temp {
+                        let _ = std::fs::remove_file(&clip.path);
+                    }
+                }
+                Err(e) => {
+                    log::error!("TTS generation failed for clip {}: {}", idx, e);
+                }
+            }
+        }
+
+        finalize_tts(&app, gen);
+    });
+
+    Ok(())
+}
+
+/// Play an audio file, blocking until playback completes.
+/// Uses the CURRENT_CHILD mechanism so playback can be interrupted.
+fn play_file(path: &str) -> Result<(), String> {
     let child = Command::new("afplay")
-        .arg(&processed_path)
+        .arg(path)
         .spawn()
         .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
 
@@ -392,10 +626,21 @@ fn speak_with_jarvis_ffmpeg(text: &str, voice: &str) -> Result<(), String> {
             .map_err(|e| format!("afplay process error: {}", e))?;
     }
 
-    // Clean up processed file
-    let _ = std::fs::remove_file(&processed_path);
-
     Ok(())
+}
+
+/// Finalize TTS: emit completion events and resume mic.
+fn finalize_tts(app: &AppHandle, gen: u64) {
+    if TTS_GENERATION.load(Ordering::SeqCst) == gen {
+        let _ = app.emit("tts:complete", serde_json::json!({}));
+        let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
+
+        // Brief cooldown for residual echo before re-enabling mic
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        capture::resume_mic();
+        capture::notify_tts_end();
+    }
 }
 
 // ── Stop ─────────────────────────────────────────────────────────────────────

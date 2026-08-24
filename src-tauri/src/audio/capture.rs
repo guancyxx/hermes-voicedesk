@@ -6,6 +6,11 @@ use tauri::{AppHandle, Emitter};
 
 static IS_CAPTURING: AtomicBool = AtomicBool::new(false);
 
+/// When true, speech detection is paused because an STT transcription is already
+/// in-flight. Prevents multiple STT jobs from being spawned while Siri/Whisper is
+/// still processing a previous clip (which caused endless "didn't catch that" loops).
+static STT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// When true, the mic callback returns immediately without processing any audio.
 /// Set during TTS playback to completely prevent echo capture.
 static MIC_SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -203,14 +208,18 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                         return;
                     }
 
-                    // Speech detection
-                    if let Some(audio_data) = det.process(rms, &samples) {
-                        let sr = det.sample_rate;
-                        let app = app_handle.clone();
-                        std::thread::spawn(move || {
-                            let _ = app.emit("audio:state", serde_json::json!({ "state": "transcribing" }));
-                            save_and_transcribe(&audio_data, sr, app);
-                        });
+                    // Speech detection — only spawn STT if none is already in-flight
+                    if !STT_IN_FLIGHT.load(Ordering::SeqCst) {
+                        if let Some(audio_data) = det.process(rms, &samples) {
+                            let sr = det.sample_rate;
+                            let app = app_handle.clone();
+                            STT_IN_FLIGHT.store(true, Ordering::SeqCst);
+                            std::thread::spawn(move || {
+                                let _ = app.emit("audio:state", serde_json::json!({ "state": "transcribing" }));
+                                save_and_transcribe(&audio_data, sr, app);
+                                STT_IN_FLIGHT.store(false, Ordering::SeqCst);
+                            });
+                        }
                     }
                 }
             },
@@ -230,6 +239,7 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
 
 pub async fn stop_mic_capture() -> Result<(), String> {
     IS_CAPTURING.store(false, Ordering::SeqCst);
+    STT_IN_FLIGHT.store(false, Ordering::SeqCst);
     // Drop the stream to stop audio capture
     *ACTIVE_STREAM.lock().unwrap() = None;
     Ok(())
