@@ -109,7 +109,9 @@ impl SpeechDetector {
     }
 
     fn max_buffer(&self) -> usize {
-        (self.sample_rate * 15) as usize
+        // 45s @ 48kHz mono i16 is about 4.3MB, which is acceptable and avoids
+        // forcibly truncating long utterances before the speaker finishes.
+        (self.sample_rate * 45) as usize
     }
 
     /// Reset detector state (called when TTS starts to flush any in-flight speech).
