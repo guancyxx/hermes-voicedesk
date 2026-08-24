@@ -332,6 +332,12 @@ onMounted(async () => {
       return
     }
 
+    if (text && !text.startsWith('[') && isProcessing) {
+      console.log('[VoiceChat] stt:result → real clip while processing, ignoring')
+      addDebugEntry('info', 'STT', 'Clip during processing — ignored')
+      return
+    }
+
     addDebugEntry('success', 'STT', `Transcribed`, `text="${text}"`)
     if (!text || text.startsWith('[')) {
       console.log(`[VoiceChat] stt:result → empty/failed, showing error`)
@@ -345,16 +351,6 @@ onMounted(async () => {
       enterWakeMode()
       return
     }
-
-    // We have real speech — stop the mic NOW. The mic must not keep running
-    // while Hermes thinks (can be minutes for tool-heavy queries): any
-    // ambient noise during that window would otherwise spawn another STT
-    // and derail the conversation. The mic comes back via enterWakeMode()
-    // after TTS completes (it is suspended during playback anyway).
-    invoke('stop_listening').catch((e) => {
-      console.warn('[VoiceChat] stop_listening after real STT result:', e)
-    })
-    isListening.value = false
 
     // Clear tool calls for new conversation round
     toolCalls.value = []
