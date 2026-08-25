@@ -653,14 +653,10 @@ async function toggleListening() {
 }
 
 async function startNewSession() {
+  // Frontend staged state must be cleared BEFORE any await: a stale
+  // tts:segment-start queued in the event loop during the awaits below
+  // must find an empty Map (safe no-op), not old segments.
   resetStagedTtsState()
-  await invoke('reset_tts_queue').catch(() => {})
-  await invoke('stop_listening').catch(() => {})
-  await invoke('stop_wake_word').catch(() => {})
-
-  isListening.value = false
-  messages.value = []
-  toolCalls.value = []
   pendingSentences.length = 0
   sentenceBuffer.value = ''
   fullResponseText.value = ''
@@ -671,6 +667,14 @@ async function startNewSession() {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
   }
+
+  await invoke('reset_tts_queue').catch(() => {})
+  await invoke('stop_listening').catch(() => {})
+  await invoke('stop_wake_word').catch(() => {})
+
+  isListening.value = false
+  messages.value = []
+  toolCalls.value = []
 
   const now = new Date().toISOString()
   sessionId.value = `voice-${now.slice(0, 10)}-${now.slice(11, 16).replace(':', '')}`
@@ -689,26 +693,29 @@ async function sendText() {
   const text = userText.value.trim()
   userText.value = ''
 
+  // Frontend staged state must be cleared BEFORE any await: a stale
+  // tts:segment-start queued in the event loop during the awaits below
+  // must find an empty Map (safe no-op), not old segments.
   resetStagedTtsState()
-
-  // Stop wake word
-  await invoke('stop_wake_word')
-  await invoke('reset_tts_queue')
   if (stagedFlushTimer !== null) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
   }
-
-  // Add user message to chat history
-  messages.value.push({ id: nextMessageId++, role: 'user', text })
-  scrollToBottom()
-
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   pendingSentences.length = 0
   isTtsActive = false
   responseFinished = false
   toolCalls.value = []
+
+  // Stop wake word
+  await invoke('stop_wake_word')
+  await invoke('reset_tts_queue')
+
+  // Add user message to chat history
+  messages.value.push({ id: nextMessageId++, role: 'user', text })
+  scrollToBottom()
+
   isProcessing = true
   state.value = 'thinking'
   addDebugEntry('info', 'API', '→ hermes_chat_stream (text)', `message="${text}"`)
