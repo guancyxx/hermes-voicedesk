@@ -33,6 +33,6 @@ futures = "0.3"
 # Audio
 cpal = "0.18"
 # ONNX Runtime for silero-vad v5 (download-binaries avoids building onnxruntime locally)
-ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
+ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
 ringbuf = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
