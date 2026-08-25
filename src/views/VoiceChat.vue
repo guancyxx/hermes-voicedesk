@@ -431,7 +431,7 @@ onMounted(async () => {
     toolCalls.value = []
 
     // Stop any in-progress TTS
-    invoke('reset_tts_queue').catch(() => {})
+    await invoke('reset_tts_queue').catch(() => {})
     if (stagedFlushTimer !== null) {
       clearTimeout(stagedFlushTimer)
       stagedFlushTimer = null
@@ -557,7 +557,7 @@ onMounted(async () => {
     if (!isTtsActive) revealAllQueuedSegments()
   })
 
-  const u7 = await listen<{ error: string }>('hermes:error', (event) => {
+  const u7 = await listen<{ error: string }>('hermes:error', async (event) => {
     addDebugEntry('error', 'API', 'Hermes error', event.payload.error)
     const lastMsg = messages.value[messages.value.length - 1]
     if (lastMsg && lastMsg.role === 'ai') {
@@ -569,7 +569,7 @@ onMounted(async () => {
       clearTimeout(stagedFlushTimer)
       stagedFlushTimer = null
     }
-    invoke('reset_tts_queue').catch(() => {})
+    await invoke('reset_tts_queue').catch(() => {})
     resetStagedTtsState()
     enterWakeMode()
   })
@@ -620,6 +620,7 @@ onUnmounted(() => {
 })
 
 async function startListening() {
+  await invoke('reset_tts_queue').catch(() => {})
   console.log('[VoiceChat] startListening')
   addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   if (stagedFlushTimer !== null) {

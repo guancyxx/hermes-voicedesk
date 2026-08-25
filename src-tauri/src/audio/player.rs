@@ -732,8 +732,9 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
         };
 
         // Play the generated audio file
+        let playback_epoch = PLAYBACK_EPOCH.load(Ordering::SeqCst);
         capture::start_barge_in_detection();
-        if let Err(e) = play_file(&clip.path) {
+        if let Err(e) = play_file(&clip.path, playback_epoch) {
             log::error!("TTS playback error: {}", e);
         }
 
@@ -998,10 +999,11 @@ fn prepare_segment(
 
 fn play_prepared_segment(prepared: PreparedSegment, is_current: &dyn Fn() -> bool) -> bool {
     for (idx, path) in prepared.playback_paths.iter().enumerate() {
+        let playback_epoch = PLAYBACK_EPOCH.load(Ordering::SeqCst);
         if !is_current() {
             return true;
         }
-        if let Err(e) = play_file(path) {
+        if let Err(e) = play_file(path, playback_epoch) {
             log::error!("TTS playback error for clip {}: {}", idx, e);
         }
     }
@@ -1243,8 +1245,7 @@ pub fn reset_tts_queue() -> Result<(), String> {
 
 /// Play an audio file, blocking until playback completes.
 /// Uses the CURRENT_CHILD mechanism so playback can be interrupted.
-fn play_file(path: &str) -> Result<(), String> {
-    let epoch_at_spawn = PLAYBACK_EPOCH.load(Ordering::SeqCst);
+fn play_file(path: &str, epoch_at_start: u64) -> Result<(), String> {
     let child = Command::new("afplay")
         .arg(path)
         .spawn()
@@ -1255,7 +1256,7 @@ fn play_file(path: &str) -> Result<(), String> {
     // one side of the barrier regardless of which acquires the lock first.
     let mut current = CURRENT_CHILD.lock().unwrap();
     *current = Some(child);
-    if playback_was_cancelled(epoch_at_spawn, PLAYBACK_EPOCH.load(Ordering::SeqCst)) {
+    if playback_was_cancelled(epoch_at_start, PLAYBACK_EPOCH.load(Ordering::SeqCst)) {
         if let Some(mut cancelled) = current.take() {
             let _ = cancelled.kill();
             let _ = cancelled.wait();
@@ -1346,14 +1347,11 @@ mod tests {
     use super::playback_was_cancelled;
 
     #[test]
-    fn playback_spawned_across_reset_is_cancelled() {
-        let epoch_before_spawn = 41;
-        let epoch_after_reset = epoch_before_spawn + 1;
+    fn playback_captured_before_reset_is_cancelled() {
+        let epoch_at_start = 41;
+        let epoch_after_reset = epoch_at_start + 1;
 
-        assert!(playback_was_cancelled(
-            epoch_before_spawn,
-            epoch_after_reset
-        ));
+        assert!(playback_was_cancelled(epoch_at_start, epoch_after_reset));
         assert!(!playback_was_cancelled(
             epoch_after_reset,
             epoch_after_reset
