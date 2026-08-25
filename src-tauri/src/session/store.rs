@@ -1,6 +1,5 @@
 /// Session storage — JSON file-based conversation history.
 /// Persists each turn as a separate JSON file in ~/.hermes-voicedesk/history/
-
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
@@ -17,7 +16,9 @@ pub struct ConversationTurn {
 /// Get the history directory: ~/.hermes-voicedesk/history/
 fn history_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".hermes-voicedesk").join("history")
+    PathBuf::from(home)
+        .join(".hermes-voicedesk")
+        .join("history")
 }
 
 /// Create a new conversation turn with auto-generated ID and timestamp.
@@ -39,11 +40,15 @@ pub fn save_turn(turn: &ConversationTurn) -> Result<(), String> {
 
     let filename = format!("{}.json", turn.id);
     let path = dir.join(&filename);
-    let json =
-        serde_json::to_string_pretty(turn).map_err(|e| format!("Failed to serialize turn: {}", e))?;
+    let json = serde_json::to_string_pretty(turn)
+        .map_err(|e| format!("Failed to serialize turn: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write turn file: {}", e))?;
 
-    log::info!("Saved conversation turn: {} (session: {})", turn.id, turn.session_id);
+    log::info!(
+        "Saved conversation turn: {} (session: {})",
+        turn.id,
+        turn.session_id
+    );
     Ok(())
 }
 
@@ -55,7 +60,8 @@ pub fn load_history(session_id: &str) -> Result<Vec<ConversationTurn>, String> {
     }
 
     let mut turns: Vec<ConversationTurn> = Vec::new();
-    let entries = fs::read_dir(&dir).map_err(|e| format!("Failed to read history directory: {}", e))?;
+    let entries =
+        fs::read_dir(&dir).map_err(|e| format!("Failed to read history directory: {}", e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;

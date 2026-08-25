@@ -1,6 +1,5 @@
 /// Hermes Agent API client.
 /// Communicates with Hermes API server at 127.0.0.1:8642.
-
 use reqwest::Client;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
@@ -84,7 +83,11 @@ pub async fn chat(message: &str, session_id: Option<&str>) -> Result<String, Str
         .map_err(|e| format!("Stream error: {}", e))?;
 
     use futures::StreamExt;
-    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("Chunk error: {}", e))? {
+    while let Some(chunk) = stream
+        .chunk()
+        .await
+        .map_err(|e| format!("Chunk error: {}", e))?
+    {
         let text = String::from_utf8_lossy(&chunk);
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -147,7 +150,11 @@ pub async fn chat_stream(
         .map_err(|e| format!("Stream error: {}", e))?;
 
     use futures::StreamExt;
-    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("Chunk error: {}", e))? {
+    while let Some(chunk) = stream
+        .chunk()
+        .await
+        .map_err(|e| format!("Chunk error: {}", e))?
+    {
         let text = String::from_utf8_lossy(&chunk);
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -156,14 +163,18 @@ pub async fn chat_stream(
                     match etype {
                         "message.delta" => {
                             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                let _ = app.emit("hermes:delta", serde_json::json!({ "content": delta }));
+                                let _ = app
+                                    .emit("hermes:delta", serde_json::json!({ "content": delta }));
                             }
                         }
                         "tool.started" => {
-                            let _ = app.emit("hermes:tool", serde_json::json!({
-                                "tool": event.get("tool").and_then(|v| v.as_str()),
-                                "status": "started"
-                            }));
+                            let _ = app.emit(
+                                "hermes:tool",
+                                serde_json::json!({
+                                    "tool": event.get("tool").and_then(|v| v.as_str()),
+                                    "status": "started"
+                                }),
+                            );
                         }
                         "tool.completed" => {
                             let _ = app.emit("hermes:tool", serde_json::json!({
@@ -173,7 +184,10 @@ pub async fn chat_stream(
                             }));
                         }
                         "run.completed" => {
-                            let _ = app.emit("hermes:finish", serde_json::json!({ "usage": event.get("usage") }));
+                            let _ = app.emit(
+                                "hermes:finish",
+                                serde_json::json!({ "usage": event.get("usage") }),
+                            );
                             return Ok(());
                         }
                         "run.failed" | "run.cancelled" => {

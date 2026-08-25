@@ -1,7 +1,6 @@
 /// macOS built-in speech recognition.
 /// Uses NSSpeechRecognizer via a Python helper with PyObjC.
 /// Falls back to an error message if PyObjC is not available.
-
 use std::process::Command;
 
 /// Transcribe an audio file using macOS built-in dictation.

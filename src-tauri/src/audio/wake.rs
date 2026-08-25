@@ -35,7 +35,10 @@ pub fn start_wake_word(app: AppHandle, access_key: Option<String>, keyword: Opti
         }
     }
 
-    log::info!("No Picovoice key — using VAD-based speech activation (keyword={})", kw);
+    log::info!(
+        "No Picovoice key — using VAD-based speech activation (keyword={})",
+        kw
+    );
     spawn_vad_wake(app);
 }
 
@@ -155,10 +158,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                 Ok(l) => {
                     log::info!("Porcupine output: {}", l);
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(&l) {
-                        let etype = event
-                            .get("event")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let etype = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
                         match etype {
                             "ready" => {
                                 let mode = event
@@ -169,10 +169,8 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                             }
                             "debug" => {
                                 // Debug messages from the Python script
-                                let msg = event
-                                    .get("message")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let msg =
+                                    event.get("message").and_then(|v| v.as_str()).unwrap_or("");
                                 log::debug!("Porcupine debug: {}", msg);
                             }
                             "wake_word" => {
@@ -184,11 +182,7 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                                     .get("mode")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("porcupine");
-                                log::info!(
-                                    "Wake word detected: {} (mode={})",
-                                    detected,
-                                    mode
-                                );
+                                log::info!("Wake word detected: {} (mode={})", detected, mode);
                                 WAKE_WORD_DETECTED.store(true, Ordering::SeqCst);
                                 let _ = app_handle.emit(
                                     "wake:detected",
@@ -203,10 +197,8 @@ fn spawn_porcupine(app: AppHandle, access_key: String, keyword: String) {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown");
                                 log::error!("Porcupine error: {}", msg);
-                                let _ = app_handle.emit(
-                                    "wake:error",
-                                    serde_json::json!({"error": msg}),
-                                );
+                                let _ = app_handle
+                                    .emit("wake:error", serde_json::json!({"error": msg}));
                                 WAKE_ACTIVE.store(false, Ordering::SeqCst);
                                 break;
                             }
@@ -268,10 +260,8 @@ fn spawn_vad_wake(app: AppHandle) {
                 Some(d) => d,
                 None => {
                     log::error!("VAD wake: no microphone");
-                    let _ = app_handle.emit(
-                        "wake:error",
-                        serde_json::json!({"error": "No microphone"}),
-                    );
+                    let _ = app_handle
+                        .emit("wake:error", serde_json::json!({"error": "No microphone"}));
                     WAKE_ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -424,14 +414,16 @@ fn spawn_vad_wake(app: AppHandle) {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                     let raw = last_rms_ref.load(Ordering::Relaxed);
                     let rms = raw as f64 / 1_000_000.0;
-                    log::debug!("VAD wake: current RMS={:.6} (threshold={})", rms, RMS_THRESHOLD);
+                    log::debug!(
+                        "VAD wake: current RMS={:.6} (threshold={})",
+                        rms,
+                        RMS_THRESHOLD
+                    );
                 }
             });
 
             // Keep stream alive while active and healthy
-            while WAKE_ACTIVE.load(Ordering::SeqCst)
-                && !stream_failed.load(Ordering::SeqCst)
-            {
+            while WAKE_ACTIVE.load(Ordering::SeqCst) && !stream_failed.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
 
@@ -486,8 +478,7 @@ fn find_script_path(name: &str) -> std::path::PathBuf {
     }
 
     // 2. In project src-tauri/scripts/ (development)
-    let mut current =
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut current = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     loop {
         let candidate = current.join("src-tauri").join("scripts").join(name);
         if candidate.exists() {

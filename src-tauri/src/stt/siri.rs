@@ -12,17 +12,15 @@ pub fn transcribe_file(path: &str) -> Option<String> {
     let helper_name = "macos-stt-helper";
     let helper_path = find_helper_binary(helper_name)?;
 
-    match std::process::Command::new(&helper_path)
-        .arg(path)
-        .output()
-    {
+    match std::process::Command::new(&helper_path).arg(path).output() {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             if !stderr.is_empty() {
                 log::warn!("STT (Siri) stderr: {}", stderr);
             }
-            if stdout.is_empty() || stdout == "[silence]" || stdout.starts_with("[macos_stt_error") {
+            if stdout.is_empty() || stdout == "[silence]" || stdout.starts_with("[macos_stt_error")
+            {
                 log::info!("STT (Siri): no transcription — {}", stdout);
                 None
             } else {
@@ -51,7 +49,10 @@ fn find_helper_binary(name: &str) -> Option<std::path::PathBuf> {
         }
 
         // 1b. In ../Resources/ (Tauri v2 resource bundling)
-        let resources_dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("../Resources");
+        let resources_dir = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("../Resources");
         if resources_dir.exists() {
             // Check for direct placement
             let direct = resources_dir.join(name);

@@ -1,6 +1,5 @@
 /// faster-whisper integration via Python subprocess.
 /// Uses faster-whisper for high-quality offline speech recognition.
-
 use std::process::Command;
 
 /// Transcribe an audio file using faster-whisper.

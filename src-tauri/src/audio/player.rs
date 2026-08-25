@@ -3,9 +3,11 @@
 /// Voice providers (priority order):
 /// 1. **Edge-TTS** (`en-GB-RyanNeural`) — Best JARVIS-like British AI butler voice.
 ///    Free Microsoft Edge TTS via `edge-tts` Python CLI. Requires internet.
-/// 2. **macOS say + ffmpeg** — Offline fallback. `say -v Daniel` with JARVIS
+/// 2. **Qwen3-TTS** (mlx-audio subprocess, voice "Ryan") — offline fallback when
+///    Edge-TTS fails. Requires `pip3 install mlx-audio` and a local model.
+/// 3. **macOS say + ffmpeg** — Offline fallback. `say -v Daniel` with JARVIS
 ///    audio post-processing via ffmpeg filters.
-/// 3. **macOS say direct** — Last resort, no dependencies.
+/// 4. **macOS say direct** — Last resort, no dependencies.
 ///
 /// **Parallel generation**: All sentences are TTS-generated in parallel (each on
 /// its own thread). Playback starts only after ALL sentences have finished
@@ -18,7 +20,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use tauri::{AppHandle, Emitter};
@@ -381,6 +383,108 @@ fn generate_edgetts(text: &str, clip_id: usize) -> Result<GeneratedClip, String>
     })
 }
 
+/// Locate qwen3_tts.py: next to executable (bundle Resources/scripts), then
+/// project tree (src-tauri/scripts/).
+fn find_qwen3_script() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("scripts").join("qwen3_tts.py");
+            if sibling.exists() {
+                return Some(sibling);
+            }
+            // Tauri resources land directly in Contents/Resources/
+            let sibling2 = dir.join("qwen3_tts.py");
+            if sibling2.exists() {
+                return Some(sibling2);
+            }
+            // Packaged .app: exe is in Contents/MacOS, tauri keeps the
+            // resource's relative path under Contents/Resources/
+            let sibling3 = dir.join("../Resources/scripts/qwen3_tts.py");
+            if sibling3.exists() {
+                return Some(sibling3);
+            }
+        }
+    }
+    let mut current = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    loop {
+        let candidate = current
+            .join("src-tauri")
+            .join("scripts")
+            .join("qwen3_tts.py");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Pick the Python interpreter for qwen3_tts.py: explicit override, then the
+/// dedicated venv (mlx-audio is not on the system python), then plain python3.
+fn qwen3_python() -> String {
+    if let Ok(p) = std::env::var("VOICEDESK_TTS_PYTHON") {
+        return p;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let venv = format!("{}/.venvs/voicedesk-tts/bin/python", home);
+        if std::path::Path::new(&venv).exists() {
+            return venv;
+        }
+    }
+    "python3".to_string()
+}
+
+/// Generate audio offline with Qwen3-TTS (mlx-audio Python subprocess).
+/// British male voice ("Ryan" — per mlx-audio README, English speakers are
+/// Ryan / Aiden). Exit code 3 = mlx_audio not installed → caller falls back
+/// to the say/ffmpeg chain.
+fn generate_qwen3_tts(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
+    let script = find_qwen3_script().ok_or_else(|| "qwen3_tts.py script not found".to_string())?;
+    let output_path = format!("/tmp/hermes_tts_qwen3_{}.wav", clip_id);
+
+    let status = run_tracked(
+        Command::new(qwen3_python())
+            .arg(script)
+            .arg("--text")
+            .arg(text)
+            .arg("--out")
+            .arg(&output_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| format!("Failed to run python3: {}", e))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        if status.code() == Some(3) {
+            return Err("mlx-audio not installed (pip3 install mlx-audio)".to_string());
+        }
+        return Err(format!("qwen3_tts.py exited with status: {}", status));
+    }
+
+    if !std::path::Path::new(&output_path).exists() {
+        return Err("qwen3_tts.py produced no output file".to_string());
+    }
+
+    // Tag the clip so the frontend/logs know which engine produced it.
+    log::warn!(
+        "TTS engine: qwen3-tts (mlx-audio fallback) produced clip {}",
+        clip_id
+    );
+    LAST_TTS_ENGINE.store(2, Ordering::SeqCst);
+
+    Ok(GeneratedClip {
+        path: output_path,
+        is_temp: true,
+    })
+}
+
+/// Last TTS engine used for the most recent utterance:
+/// 0 = edge-tts, 1 = say/ffmpeg, 2 = qwen3-tts.
+static LAST_TTS_ENGINE: AtomicI32 = AtomicI32::new(0);
+
 /// Generate audio file using macOS say + ffmpeg JARVIS filter.
 fn generate_jarvis_ffmpeg(
     text: &str,
@@ -488,10 +592,21 @@ fn generate_clip(text: &str, clip_id: usize) -> Result<GeneratedClip, String> {
             Ok(clip) => return Ok(clip),
             Err(e) => {
                 log::warn!(
-                    "Edge-TTS generation failed for clip {}: {}, falling back",
+                    "Edge-TTS generation failed for clip {}: {}, falling back to Qwen3-TTS",
                     clip_id,
                     e
                 );
+                // Offline fallback #1: Qwen3-TTS via mlx-audio subprocess
+                match generate_qwen3_tts(text, clip_id) {
+                    Ok(clip) => return Ok(clip),
+                    Err(qe) => {
+                        log::warn!(
+                            "Qwen3-TTS fallback failed for clip {}: {}, falling back to say",
+                            clip_id,
+                            qe
+                        );
+                    }
+                }
             }
         }
     }
@@ -535,6 +650,7 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
     // 3. Signal TTS-start and suspend mic
     capture::notify_tts_start();
     capture::suspend_mic();
+    LAST_TTS_ENGINE.store(0, Ordering::SeqCst);
 
     let text_owned = text.to_string();
     let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
@@ -548,12 +664,28 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
             if use_jarvis && has_edge_tts() {
                 match generate_edgetts(&text_owned, clip_id) {
                     Ok(c) => Ok(c),
-                    Err(_) => {
-                        let voice = get_voice_for_text(&text_owned);
-                        if has_ffmpeg() {
-                            generate_jarvis_ffmpeg(&text_owned, &voice, clip_id)
-                        } else {
-                            generate_say_direct(&text_owned, &voice, clip_id)
+                    Err(edge_err) => {
+                        log::warn!(
+                            "Edge-TTS failed for clip {}: {} — trying Qwen3-TTS fallback",
+                            clip_id,
+                            edge_err
+                        );
+                        // Offline fallback #1: Qwen3-TTS via mlx-audio subprocess
+                        match generate_qwen3_tts(&text_owned, clip_id) {
+                            Ok(c) => Ok(c),
+                            Err(qe) => {
+                                log::warn!(
+                                    "Qwen3-TTS fallback failed for clip {}: {} — falling back to say",
+                                    clip_id,
+                                    qe
+                                );
+                                let voice = get_voice_for_text(&text_owned);
+                                if has_ffmpeg() {
+                                    generate_jarvis_ffmpeg(&text_owned, &voice, clip_id)
+                                } else {
+                                    generate_say_direct(&text_owned, &voice, clip_id)
+                                }
+                            }
                         }
                     }
                 }
@@ -701,6 +833,7 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
     // 3. Signal TTS-start and suspend mic
     capture::notify_tts_start();
     capture::suspend_mic();
+    LAST_TTS_ENGINE.store(0, Ordering::SeqCst);
 
     std::thread::spawn(move || {
         run_segment(texts, gen, &|| TTS_GENERATION.load(Ordering::SeqCst) == gen);
@@ -961,9 +1094,11 @@ fn queue_worker(app: AppHandle, round_id: u64) {
         // Re-validate after the cooldown: if a reset (or a new round) started
         // during the sleep, this worker must NOT touch the mic — the new
         // round owns it now.
-        let still_current = QUEUE.lock().unwrap().as_ref().is_some_and(|state| {
-            state.active && state.round_id == round_id
-        });
+        let still_current = QUEUE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.active && state.round_id == round_id);
         if still_current {
             capture::resume_mic();
         }
@@ -1036,7 +1171,12 @@ fn play_file(path: &str) -> Result<(), String> {
 /// events (tts:complete / audio:state) are gated on the generation check.
 fn finalize_tts(app: &AppHandle, gen: u64) {
     if TTS_GENERATION.load(Ordering::SeqCst) == gen {
-        let _ = app.emit("tts:complete", serde_json::json!({}));
+        let engine = match LAST_TTS_ENGINE.load(Ordering::SeqCst) {
+            2 => "qwen3-tts",
+            1 => "say-ffmpeg",
+            _ => "edge-tts",
+        };
+        let _ = app.emit("tts:complete", serde_json::json!({ "engine": engine }));
         let _ = app.emit("audio:state", serde_json::json!({"state": "idle"}));
 
         // Brief cooldown for residual echo before re-enabling mic
