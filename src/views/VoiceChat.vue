@@ -213,8 +213,8 @@ async function flushPendingSegment(final: boolean) {
     addDebugEntry('error', 'TTS', 'speak_batch_queued failed', String(e))
     isTtsActive = false
     if (segmentIndex !== null) revealSegment(segmentIndex)
-    await invoke('reset_tts_queue').catch(() => {})
     resetStagedTtsState()
+    await invoke('reset_tts_queue').catch(() => {})
   }
 }
 
@@ -427,11 +427,12 @@ onMounted(async () => {
       return
     }
 
+    isProcessing = true
+
     // Clear tool calls for new conversation round
     toolCalls.value = []
 
     // Stop any in-progress TTS
-    await invoke('reset_tts_queue').catch(() => {})
     if (stagedFlushTimer !== null) {
       clearTimeout(stagedFlushTimer)
       stagedFlushTimer = null
@@ -442,13 +443,13 @@ onMounted(async () => {
     sentenceBuffer.value = ''
     fullResponseText.value = ''
     responseFinished = false
+    await invoke('reset_tts_queue').catch(() => {})
 
     // Add user message to chat history
     messages.value.push({ id: nextMessageId++, role: 'user', text })
     scrollToBottom()
 
     console.log(`[VoiceChat] → hermes_chat_stream: "${text}"`)
-    isProcessing = true
     state.value = 'thinking'
     addDebugEntry('info', 'API', '→ hermes_chat_stream', `message="${text}"`)
 
@@ -569,8 +570,8 @@ onMounted(async () => {
       clearTimeout(stagedFlushTimer)
       stagedFlushTimer = null
     }
-    await invoke('reset_tts_queue').catch(() => {})
     resetStagedTtsState()
+    await invoke('reset_tts_queue').catch(() => {})
     enterWakeMode()
   })
 
@@ -620,9 +621,6 @@ onUnmounted(() => {
 })
 
 async function startListening() {
-  await invoke('reset_tts_queue').catch(() => {})
-  console.log('[VoiceChat] startListening')
-  addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   if (stagedFlushTimer !== null) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
@@ -634,6 +632,9 @@ async function startListening() {
   isTtsActive = false
   isProcessing = false
   responseFinished = false
+  await invoke('reset_tts_queue').catch(() => {})
+  console.log('[VoiceChat] startListening')
+  addDebugEntry('info', 'STATE', '→ listening', 'Mic started')
   await invoke('start_listening')
   isListening.value = true
 }
@@ -652,8 +653,8 @@ async function toggleListening() {
 }
 
 async function startNewSession() {
-  await invoke('reset_tts_queue').catch(() => {})
   resetStagedTtsState()
+  await invoke('reset_tts_queue').catch(() => {})
   await invoke('stop_listening').catch(() => {})
   await invoke('stop_wake_word').catch(() => {})
 
@@ -688,10 +689,11 @@ async function sendText() {
   const text = userText.value.trim()
   userText.value = ''
 
+  resetStagedTtsState()
+
   // Stop wake word
   await invoke('stop_wake_word')
   await invoke('reset_tts_queue')
-  resetStagedTtsState()
   if (stagedFlushTimer !== null) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
