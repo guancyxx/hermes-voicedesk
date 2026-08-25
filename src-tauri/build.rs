@@ -22,7 +22,10 @@ fn compile_macos_stt_helper() {
             if let Ok(out_meta) = std::fs::metadata(&out_path) {
                 if let (Ok(src_time), Ok(out_time)) = (src_meta.modified(), out_meta.modified()) {
                     if out_time >= src_time {
-                        println!("cargo:warning=macos-stt-helper up to date: {}", out_path.display());
+                        println!(
+                            "cargo:warning=macos-stt-helper up to date: {}",
+                            out_path.display()
+                        );
                         return;
                     }
                 }
@@ -43,13 +46,22 @@ fn compile_macos_stt_helper() {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:warning=compiled macos-stt-helper -> {}", out_path.display());
+            println!(
+                "cargo:warning=compiled macos-stt-helper -> {}",
+                out_path.display()
+            );
         }
         Ok(s) => {
-            println!("cargo:warning=macos-stt-helper compilation warning (non-fatal): exit={}", s);
+            println!(
+                "cargo:warning=macos-stt-helper compilation warning (non-fatal): exit={}",
+                s
+            );
         }
         Err(e) => {
-            println!("cargo:warning=swiftc not found, skipping macos-stt-helper: {}", e);
+            println!(
+                "cargo:warning=swiftc not found, skipping macos-stt-helper: {}",
+                e
+            );
         }
     }
 }

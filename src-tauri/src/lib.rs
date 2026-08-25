@@ -1,7 +1,7 @@
-mod audio;
-mod stt;
 mod api;
+mod audio;
 mod session;
+mod stt;
 
 use std::sync::Mutex;
 use tauri::{
@@ -130,7 +130,10 @@ async fn load_jarvis_persona(activate: bool) -> Result<String, String> {
 
         match api::hermes::chat(&setup_message, None).await {
             Ok(response) => {
-                log::info!("JARVIS persona activated: {}", &response[..response.len().min(120)]);
+                log::info!(
+                    "JARVIS persona activated: {}",
+                    &response[..response.len().min(120)]
+                );
             }
             Err(e) => {
                 log::warn!("Failed to activate JARVIS persona on Hermes API: {}", e);
@@ -246,11 +249,8 @@ pub fn run() {
                 } else {
                     log::LevelFilter::Info
                 };
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(level)
-                        .build(),
-                )?;
+                app.handle()
+                    .plugin(tauri_plugin_log::Builder::default().level(level).build())?;
             }
 
             // ---- Tray Icon ----
@@ -331,7 +331,9 @@ pub fn run() {
 }
 
 fn setup_global_shortcut(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+    use tauri_plugin_global_shortcut::{
+        Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+    };
 
     let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
     let app_handle = app.handle().clone();
