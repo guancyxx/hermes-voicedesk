@@ -83,6 +83,12 @@ fn reset_tts_queue() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_barge_in_enabled(enabled: bool) -> Result<(), String> {
+    audio::capture::set_barge_in_enabled(enabled);
+    Ok(())
+}
+
+#[tauri::command]
 fn stop_speaking() -> Result<(), String> {
     audio::player::stop()
 }
@@ -309,6 +315,7 @@ pub fn run() {
             speak_batch,
             speak_batch_queued,
             reset_tts_queue,
+            set_barge_in_enabled,
             stop_speaking,
             notify_tts_start,
             notify_tts_end,

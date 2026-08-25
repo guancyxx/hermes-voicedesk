@@ -31,10 +31,27 @@ use crate::audio::capture;
 static TTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 struct QueueState {
-    segments: VecDeque<Vec<String>>,
+    segments: VecDeque<QueuedSegment>,
     finished: bool,
     active: bool,
     round_id: u64,
+    next_segment_index: u64,
+}
+
+struct QueuedSegment {
+    index: u64,
+    prepared: std::sync::mpsc::Receiver<Option<PreparedSegment>>,
+}
+
+struct PreparedSegment {
+    playback_paths: Vec<String>,
+    cleanup_paths: Vec<String>,
+}
+
+impl Drop for PreparedSegment {
+    fn drop(&mut self) {
+        cleanup_files(&self.cleanup_paths);
+    }
 }
 
 static QUEUE: Mutex<Option<QueueState>> = Mutex::new(None);
@@ -43,12 +60,18 @@ static QUEUE_CV: Condvar = Condvar::new();
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Playback epoch: bumped before every playback stop. A player captures this
+/// before spawning and re-checks it after registering in CURRENT_CHILD so a
+/// process spawned concurrently with reset cannot escape the stop snapshot.
+static PLAYBACK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Generation epoch: bumped by every reset_tts_queue(). Generation threads
 /// capture the epoch at start; a killed sub-process returning failure must NOT
 /// fall back to spawning a NEW sub-process (say/ffmpeg) after a reset — that
 /// would escape the kill snapshot and keep burning CPU/disk after the round
 /// was cancelled.
 static GENERATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+static SEGMENT_GENERATION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Generation processes are tracked separately from the playback child.
 static GENERATION_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -709,7 +732,9 @@ pub fn speak(text: &str, app: AppHandle) -> Result<(), String> {
         };
 
         // Play the generated audio file
-        if let Err(e) = play_file(&clip.path) {
+        let playback_epoch = PLAYBACK_EPOCH.load(Ordering::SeqCst);
+        capture::start_barge_in_detection();
+        if let Err(e) = play_file(&clip.path, playback_epoch) {
             log::error!("TTS playback error: {}", e);
         }
 
@@ -843,8 +868,13 @@ pub fn speak_batch(texts: Vec<String>, app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Generate and play one segment. Returns true when a newer generation aborted it.
-fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> bool {
+/// Generate and prepare one segment without playing it. This is intentionally
+/// independent from playback so queued segments can be prefetched.
+fn prepare_segment(
+    texts: Vec<String>,
+    gen: u64,
+    is_current: &dyn Fn() -> bool,
+) -> Option<PreparedSegment> {
     let pid = std::process::id() as u64;
     let base_clip_id = (pid * 10000 + gen * 100) as usize;
     let use_jarvis = JARVIS_MODE.load(Ordering::SeqCst);
@@ -917,13 +947,17 @@ fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> b
             gen
         );
         cleanup_originals();
-        return true;
+        return None;
     }
     if generated_clips.is_empty() {
-        return false;
+        return None;
     }
 
-    let mut played_merged = false;
+    let original_paths: Vec<String> = generated_clips
+        .iter()
+        .filter(|clip| clip.is_temp)
+        .map(|clip| clip.path.clone())
+        .collect();
     if has_ff {
         match concat_batch_clips(&generated_clips, pid, gen) {
             Ok((merged_path, temporary_paths)) => {
@@ -934,14 +968,14 @@ fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> b
                     );
                     cleanup_files(&temporary_paths);
                     cleanup_originals();
-                    return true;
+                    return None;
                 }
-                if let Err(e) = play_file(&merged_path) {
-                    log::error!("TTS merged playback error: {}", e);
-                } else {
-                    played_merged = true;
-                }
-                cleanup_files(&temporary_paths);
+                let mut cleanup_paths = original_paths;
+                cleanup_paths.extend(temporary_paths);
+                return Some(PreparedSegment {
+                    playback_paths: vec![merged_path],
+                    cleanup_paths,
+                });
             }
             Err(e) => log::warn!(
                 "TTS batch concat failed, falling back to sequential playback: {}",
@@ -954,23 +988,35 @@ fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> b
         );
     }
 
-    if !played_merged {
-        for (idx, clip) in generated_clips.iter().enumerate() {
-            if !is_current() {
-                log::info!(
-                    "TTS batch: generation {} superseded, aborting playback",
-                    gen
-                );
-                cleanup_originals();
-                return true;
-            }
-            if let Err(e) = play_file(&clip.path) {
-                log::error!("TTS playback error for clip {}: {}", idx, e);
-            }
+    Some(PreparedSegment {
+        playback_paths: generated_clips
+            .iter()
+            .map(|clip| clip.path.clone())
+            .collect(),
+        cleanup_paths: original_paths,
+    })
+}
+
+fn play_prepared_segment(prepared: PreparedSegment, is_current: &dyn Fn() -> bool) -> bool {
+    for (idx, path) in prepared.playback_paths.iter().enumerate() {
+        let playback_epoch = PLAYBACK_EPOCH.load(Ordering::SeqCst);
+        if !is_current() {
+            return true;
+        }
+        if let Err(e) = play_file(path, playback_epoch) {
+            log::error!("TTS playback error for clip {}: {}", idx, e);
         }
     }
-    cleanup_originals();
     false
+}
+
+/// Generate and play one segment. Returns true when a newer generation aborted it.
+fn run_segment(texts: Vec<String>, gen: u64, is_current: &dyn Fn() -> bool) -> bool {
+    let Some(prepared) = prepare_segment(texts, gen, is_current) else {
+        return !is_current();
+    };
+    capture::start_barge_in_detection();
+    play_prepared_segment(prepared, is_current)
 }
 
 fn queue_is_active() -> bool {
@@ -1010,10 +1056,30 @@ pub fn speak_batch_queued(
             finished: false,
             active: false,
             round_id: 0,
+            next_segment_index: 0,
         });
         let has_texts = !texts.is_empty();
         if has_texts {
-            state.segments.push_back(texts);
+            if state.finished && !state.active {
+                state.next_segment_index = 0;
+            }
+            let index = state.next_segment_index;
+            state.next_segment_index += 1;
+            let round_for_generation = state.round_id;
+            let generation_id = SEGMENT_GENERATION_ID.fetch_add(1, Ordering::SeqCst) + 1;
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let prepared = prepare_segment(texts, generation_id, &|| {
+                    QUEUE.lock().unwrap().as_ref().is_some_and(|current| {
+                        current.active && current.round_id == round_for_generation
+                    })
+                });
+                let _ = sender.send(prepared);
+            });
+            state.segments.push_back(QueuedSegment {
+                index,
+                prepared: receiver,
+            });
         }
         // A new conversation round starts here: if a previous reset set
         // finished=true (to retire the old worker), the first enqueue of the
@@ -1045,6 +1111,7 @@ pub fn speak_batch_queued(
 
 fn queue_worker(app: AppHandle, round_id: u64) {
     let _guard = QueueWorkerGuard { round_id };
+    let mut playback_started = false;
     loop {
         let segment = {
             let mut queue = QUEUE.lock().unwrap();
@@ -1067,13 +1134,36 @@ fn queue_worker(app: AppHandle, round_id: u64) {
         };
 
         if let Some(segment) = segment {
-            if run_segment(segment, round_id, &|| {
+            let prepared = match segment.prepared.recv() {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!("TTS prefetch worker failed: {}", error);
+                    None
+                }
+            };
+            let is_current = || {
                 QUEUE
                     .lock()
                     .unwrap()
                     .as_ref()
                     .is_some_and(|state| state.active && state.round_id == round_id)
-            }) {
+            };
+            if let Some(prepared) = prepared {
+                if !is_current() {
+                    return;
+                }
+                if !playback_started {
+                    capture::start_barge_in_detection();
+                    playback_started = true;
+                }
+                let _ = app.emit(
+                    "tts:segment-start",
+                    serde_json::json!({ "index": segment.index }),
+                );
+                if play_prepared_segment(prepared, &is_current) {
+                    return;
+                }
+            } else if !is_current() {
                 return;
             }
             continue;
@@ -1100,6 +1190,7 @@ fn queue_worker(app: AppHandle, round_id: u64) {
             .as_ref()
             .is_some_and(|state| state.active && state.round_id == round_id);
         if still_current {
+            capture::stop_barge_in_detection();
             capture::resume_mic();
         }
         let mut queue = QUEUE.lock().unwrap();
@@ -1122,15 +1213,21 @@ pub fn reset_tts_queue() -> Result<(), String> {
             finished: false,
             active: false,
             round_id: 0,
+            next_segment_index: 0,
         });
         let was_active = state.active;
         state.round_id = state.round_id.wrapping_add(1);
         state.segments.clear();
         state.finished = true;
         state.active = false;
+        state.next_segment_index = 0;
         was_active
     };
     QUEUE_CV.notify_all();
+    // Bump before taking CURRENT_CHILD. A concurrent play_file either registers
+    // before our take (and is killed here), or registers afterwards, observes
+    // the changed epoch while holding the same lock, and kills itself.
+    PLAYBACK_EPOCH.fetch_add(1, Ordering::SeqCst);
     stop_child_process();
     // Cancel barrier FIRST: bump the epoch so in-flight generation threads
     // that get killed here do not fall back to spawning new sub-processes,
@@ -1138,6 +1235,7 @@ pub fn reset_tts_queue() -> Result<(), String> {
     GENERATION_EPOCH.fetch_add(1, Ordering::SeqCst);
     kill_generation_processes();
 
+    capture::stop_barge_in_detection();
     capture::resume_mic();
     if was_active {
         capture::notify_tts_end();
@@ -1147,21 +1245,50 @@ pub fn reset_tts_queue() -> Result<(), String> {
 
 /// Play an audio file, blocking until playback completes.
 /// Uses the CURRENT_CHILD mechanism so playback can be interrupted.
-fn play_file(path: &str) -> Result<(), String> {
+fn play_file(path: &str, epoch_at_start: u64) -> Result<(), String> {
     let child = Command::new("afplay")
         .arg(path)
         .spawn()
         .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
 
-    *CURRENT_CHILD.lock().unwrap() = Some(child);
-
-    if let Some(mut child_to_wait) = CURRENT_CHILD.lock().unwrap().take() {
-        child_to_wait
-            .wait()
-            .map_err(|e| format!("afplay process error: {}", e))?;
+    // Register BEFORE checking the epoch. Registration and reset's kill
+    // snapshot both take CURRENT_CHILD, so the spawned process is covered by
+    // one side of the barrier regardless of which acquires the lock first.
+    let mut current = CURRENT_CHILD.lock().unwrap();
+    *current = Some(child);
+    if playback_was_cancelled(epoch_at_start, PLAYBACK_EPOCH.load(Ordering::SeqCst)) {
+        if let Some(mut cancelled) = current.take() {
+            let _ = cancelled.kill();
+            let _ = cancelled.wait();
+        }
+        return Ok(());
     }
+    drop(current);
 
-    Ok(())
+    loop {
+        let mut current = CURRENT_CHILD.lock().unwrap();
+        let Some(child) = current.as_mut() else {
+            // reset/stop took and terminated the playback child.
+            return Ok(());
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                current.take();
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                current.take();
+                return Err(format!("afplay process error: {}", error));
+            }
+        }
+        drop(current);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn playback_was_cancelled(epoch_at_spawn: u64, current_epoch: u64) -> bool {
+    epoch_at_spawn != current_epoch
 }
 
 /// Finalize TTS: emit completion events and resume mic.
@@ -1182,6 +1309,7 @@ fn finalize_tts(app: &AppHandle, gen: u64) {
         // Brief cooldown for residual echo before re-enabling mic
         std::thread::sleep(std::time::Duration::from_millis(500));
 
+        capture::stop_barge_in_detection();
         capture::resume_mic();
     }
     capture::notify_tts_end();
@@ -1212,4 +1340,21 @@ pub fn stop() -> Result<(), String> {
     // `stop` also cancels legacy speak/speak_batch generations; queue resets do not.
     TTS_GENERATION.fetch_add(1, Ordering::SeqCst);
     reset_tts_queue()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_was_cancelled;
+
+    #[test]
+    fn playback_captured_before_reset_is_cancelled() {
+        let epoch_at_start = 41;
+        let epoch_after_reset = epoch_at_start + 1;
+
+        assert!(playback_was_cancelled(epoch_at_start, epoch_after_reset));
+        assert!(!playback_was_cancelled(
+            epoch_after_reset,
+            epoch_after_reset
+        ));
+    }
 }

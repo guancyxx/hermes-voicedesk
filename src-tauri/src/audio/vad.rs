@@ -16,8 +16,8 @@ const RMS_FALLBACK_THRESHOLD: f32 = 0.01;
 /// Consecutive speech frames (576 @ 16kHz = 36ms each) to confirm start (~110ms).
 const START_CONFIRM_FRAMES: u32 = 3;
 
-/// Consecutive silence frames to confirm end. 12 frames ≈ 430ms (spec: 300–500ms).
-const END_CONFIRM_FRAMES: u32 = 12;
+/// Consecutive silence frames to confirm end. 22 frames ≈ 800ms.
+const END_CONFIRM_FRAMES: u32 = 22;
 
 /// Maximum speech duration in Silero frames (30s).
 const MAX_SPEECH_FRAMES: u32 = 833;
@@ -242,11 +242,11 @@ impl VadEngine {
         silero().is_some()
     }
 
-    /// Feed a chunk of mic samples (any length, at `input_rate`). Returns an
-    /// event when speech starts or ends. Audio in `SpeechEnd` is 16kHz i16.
-    pub fn process_samples(&mut self, samples: &[i16]) -> Option<VadEvent> {
+    /// Feed a chunk of mic samples (any length, at `input_rate`). Returns every
+    /// event produced by the chunk. Audio in `SpeechEnd` is 16kHz i16.
+    pub fn process_samples(&mut self, samples: &[i16]) -> Vec<VadEvent> {
         if samples.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         let downsampled = self.downsampler.process(samples).to_vec();
@@ -281,15 +281,43 @@ impl VadEngine {
             }
         }
 
-        // Match old single-event semantics: return the first event.
-        events.into_iter().next()
+        events
     }
 
     /// Legacy 30ms-frame entry point kept for API compatibility. If capture.rs
     /// still calls process_frame with input-rate frames, we just route through
     /// the new pipeline.
-    pub fn process_frame(&mut self, frame: &[i16]) -> Option<VadEvent> {
+    pub fn process_frame(&mut self, frame: &[i16]) -> Vec<VadEvent> {
         self.process_samples(frame)
+    }
+
+    /// Return raw Silero probabilities for complete frames in `samples`.
+    /// Intended for a separate, strict barge-in detector instance.
+    pub fn process_probabilities(&mut self, samples: &[i16]) -> Vec<f32> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
+        let downsampled = self.downsampler.process(samples).to_vec();
+        self.frame_buf.extend(
+            downsampled
+                .into_iter()
+                .map(|sample| sample as f32 / 32768.0),
+        );
+        let mut probabilities = Vec::new();
+        while self.frame_buf.len() >= SILERO_FRAME {
+            let frame: Vec<f32> = self.frame_buf.drain(..SILERO_FRAME).collect();
+            let probability = self.classify_frame(&frame).unwrap_or_else(|| {
+                let sum: f64 = frame.iter().map(|&x| (x as f64).powi(2)).sum();
+                let rms = (sum / frame.len() as f64).sqrt() as f32;
+                if rms > RMS_FALLBACK_THRESHOLD {
+                    1.0
+                } else {
+                    0.0
+                }
+            });
+            probabilities.push(probability);
+        }
+        probabilities
     }
 
     /// Run one 576-sample frame through the ONNX model. Returns speech
@@ -376,6 +404,24 @@ impl VadEngine {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_confirmation_is_about_eight_hundred_milliseconds() {
+        assert_eq!(END_CONFIRM_FRAMES, 22);
+        assert_eq!(END_CONFIRM_FRAMES as usize * SILERO_FRAME, 12_672);
+    }
+
+    #[test]
+    fn empty_chunks_produce_no_events_or_probabilities() {
+        let mut vad = VadEngine::new(48_000);
+        assert!(vad.process_samples(&[]).is_empty());
+        assert!(vad.process_probabilities(&[]).is_empty());
     }
 }
 
