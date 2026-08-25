@@ -51,5 +51,6 @@ defineProps<{
 
 .bubble-text {
   white-space: pre-wrap;
+  text-align: left;
 }
 </style>

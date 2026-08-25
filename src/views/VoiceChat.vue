@@ -31,6 +31,7 @@ const transcribedText = ref('')
 const wakeMode = ref<'vad' | 'porcupine' | ''>('')
 const wakeKeyword = ref('')
 const wakeEnabled = ref(true)
+const bargeInEnabled = ref(true)
 
 // Session ID — date-based for grouping turns by day
 const sessionId = ref(`voice-${new Date().toISOString().slice(0, 10)}`)
@@ -67,6 +68,8 @@ const STAGED_TTS_SEGMENT_SIZE = 3
 const STAGED_TTS_SILENCE_MS = 1500
 const sentenceBuffer = ref('')
 const pendingSentences: string[] = []
+const queuedSegmentText = new Map<number, string>()
+let nextQueuedSegmentIndex = 0
 let isTtsActive = false
 let isProcessing = false
 let responseFinished = false
@@ -173,13 +176,28 @@ function enqueueSentence(sentence: string) {
   pendingSentences.push(trimmed)
 }
 
+function revealSegment(index: number) {
+  const text = queuedSegmentText.get(index)
+  if (!text) return
+  queuedSegmentText.delete(index)
+  messages.value.push({ id: nextMessageId++, role: 'ai', text })
+  scrollToBottom()
+}
+
+function revealAllQueuedSegments() {
+  for (const index of [...queuedSegmentText.keys()].sort((a, b) => a - b)) {
+    revealSegment(index)
+  }
+}
+
 async function flushPendingSegment(final: boolean) {
   if (pendingSentences.length === 0 && !final) return
 
   const sentences = pendingSentences.splice(0)
+  let segmentIndex: number | null = null
   if (sentences.length > 0) {
-    messages.value.push({ id: nextMessageId++, role: 'ai', text: sentences.join('') })
-    scrollToBottom()
+    segmentIndex = nextQueuedSegmentIndex++
+    queuedSegmentText.set(segmentIndex, sentences.join(''))
   }
 
   addDebugEntry('info', 'TTS', `Queueing staged TTS segment with ${sentences.length} sentences`)
@@ -189,6 +207,7 @@ async function flushPendingSegment(final: boolean) {
     console.error('speak_batch_queued failed:', e)
     addDebugEntry('error', 'TTS', 'speak_batch_queued failed', String(e))
     isTtsActive = false
+    if (segmentIndex !== null) revealSegment(segmentIndex)
     await invoke('reset_tts_queue').catch(() => {})
   }
 }
@@ -412,6 +431,8 @@ onMounted(async () => {
       stagedFlushTimer = null
     }
     pendingSentences.length = 0
+    queuedSegmentText.clear()
+    nextQueuedSegmentIndex = 0
     isTtsActive = false
     sentenceBuffer.value = ''
     fullResponseText.value = ''
@@ -510,33 +531,25 @@ onMounted(async () => {
     // Save this turn to history using the full response text. Segment bubbles
     // are presentation-only and do not alter the persisted turn payload.
     const msgs = messages.value
-    let lastAiIndex = -1
+    let lastUser: Message | undefined
     for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'ai') {
-        lastAiIndex = i
+      if (msgs[i].role === 'user') {
+        lastUser = msgs[i]
         break
       }
     }
-    if (lastAiIndex >= 0) {
-      let lastUser: Message | undefined
-      for (let i = lastAiIndex - 1; i >= 0; i--) {
-        if (msgs[i].role === 'user') {
-          lastUser = msgs[i]
-          break
-        }
-      }
-      if (lastUser) {
-        invoke('save_chat_history', {
-          sessionId: sessionId.value,
-          userText: lastUser.text,
-          aiText: fullResponseText.value,
-        }).catch((e) => console.error('Failed to save chat history:', e))
-      }
+    if (lastUser) {
+      invoke('save_chat_history', {
+        sessionId: sessionId.value,
+        userText: lastUser.text,
+        aiText: fullResponseText.value,
+      }).catch((e) => console.error('Failed to save chat history:', e))
     }
 
     // Enqueue the tail first, then atomically deliver the finish signal even
     // when the response ended exactly on a previous segment boundary.
     await flushPendingSegment(true)
+    if (!isTtsActive) revealAllQueuedSegments()
   })
 
   const u7 = await listen<{ error: string }>('hermes:error', (event) => {
@@ -546,6 +559,7 @@ onMounted(async () => {
       lastMsg.text += `\n\nError: ${event.payload.error}`
     }
     responseFinished = true
+    revealAllQueuedSegments()
     if (stagedFlushTimer !== null) {
       clearTimeout(stagedFlushTimer)
       stagedFlushTimer = null
@@ -559,6 +573,7 @@ onMounted(async () => {
     addDebugEntry('info', 'TTS', 'TTS queue drained — all staged sentences played')
     isTtsActive = false
     lastTtsCompleteAt = Date.now()
+    revealAllQueuedSegments()
     // Pin chat to the latest content after playback finishes — the user must
     // end up looking at the final reply, not somewhere mid-history.
     scrollToBottom()
@@ -569,7 +584,24 @@ onMounted(async () => {
     }
   })
 
-  unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11]
+  const u12 = await listen<{ index: number }>('tts:segment-start', (event) => {
+    revealSegment(event.payload.index)
+  })
+
+  const u13 = await listen('barge-in:detected', () => {
+    addDebugEntry('info', 'TTS', 'Barge-in detected — playback interrupted')
+    isTtsActive = false
+    isProcessing = false
+    responseFinished = false
+    pendingSentences.length = 0
+    queuedSegmentText.clear()
+    sentenceBuffer.value = ''
+    state.value = 'listening'
+  })
+
+  unlisteners = [u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13]
+
+  await invoke('set_barge_in_enabled', { enabled: bargeInEnabled.value })
 
   // Auto-start wake word detection on app launch
   enterWakeMode()
@@ -591,6 +623,8 @@ async function startListening() {
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   pendingSentences.length = 0
+  queuedSegmentText.clear()
+  nextQueuedSegmentIndex = 0
   isTtsActive = false
   isProcessing = false
   responseFinished = false
@@ -620,6 +654,8 @@ async function startNewSession() {
   messages.value = []
   toolCalls.value = []
   pendingSentences.length = 0
+  queuedSegmentText.clear()
+  nextQueuedSegmentIndex = 0
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   isTtsActive = false
@@ -695,6 +731,12 @@ async function toggleWake() {
     enterWakeMode()
   }
 }
+
+async function toggleBargeIn() {
+  bargeInEnabled.value = !bargeInEnabled.value
+  await invoke('set_barge_in_enabled', { enabled: bargeInEnabled.value })
+  addDebugEntry('info', 'SYSTEM', `Barge-in ${bargeInEnabled.value ? 'enabled' : 'disabled'}`)
+}
 </script>
 
 <template>
@@ -711,6 +753,14 @@ async function toggleWake() {
           title="Toggle Debug Panel"
         >
           🐛
+        </button>
+        <button
+          class="btn-barge-in"
+          :class="{ active: bargeInEnabled }"
+          @click="toggleBargeIn"
+          :title="bargeInEnabled ? 'Barge-in ON' : 'Barge-in OFF'"
+        >
+          {{ bargeInEnabled ? '🗣️' : '🚫' }}
         </button>
         <button
           class="btn-wake"
@@ -842,7 +892,8 @@ async function toggleWake() {
   opacity: 0.9;
 }
 
-.btn-wake {
+.btn-wake,
+.btn-barge-in {
   padding: 6px 10px;
   border-radius: 20px;
   border: 1px solid #4a4a8a;
@@ -853,12 +904,14 @@ async function toggleWake() {
   line-height: 1;
 }
 
-.btn-wake.active {
+.btn-wake.active,
+.btn-barge-in.active {
   border-color: #6c5ce7;
   background: rgba(108, 92, 231, 0.15);
 }
 
-.btn-wake:hover {
+.btn-wake:hover,
+.btn-barge-in:hover {
   opacity: 0.9;
 }
 

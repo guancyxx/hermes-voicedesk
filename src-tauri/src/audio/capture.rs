@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 static IS_CAPTURING: AtomicBool = AtomicBool::new(false);
@@ -14,6 +14,15 @@ static STT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// When true, the mic callback returns immediately without processing any audio.
 /// Set during TTS playback to completely prevent echo capture.
 static MIC_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+static BARGE_IN_ENABLED: AtomicBool = AtomicBool::new(true);
+static BARGE_IN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BARGE_IN_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+const CONTINUATION_GRACE: Duration = Duration::from_millis(1200);
+const BARGE_IN_GUARD_MS: u64 = 800;
+const BARGE_IN_THRESHOLD: f32 = 0.85;
+const BARGE_IN_CONFIRM_FRAMES: u32 = 14;
 
 /// TTS playback counter. > 0 means TTS is currently playing.
 /// Using a counter instead of a bool prevents a stale TTS-end callback from
@@ -43,6 +52,31 @@ pub fn suspend_mic() {
 /// Resume the microphone callback — samples are processed again normally.
 pub fn resume_mic() {
     MIC_SUSPENDED.store(false, Ordering::SeqCst);
+}
+
+/// Resume immediately after an intentional interruption. The strict barge-in
+/// confirmation replaces the normal post-TTS echo cooldown for this path.
+fn resume_mic_after_barge_in() {
+    LAST_TTS_END_MS.store(0, Ordering::SeqCst);
+    resume_mic();
+}
+
+pub fn set_barge_in_enabled(enabled: bool) {
+    BARGE_IN_ENABLED.store(enabled, Ordering::SeqCst);
+    if !enabled {
+        stop_barge_in_detection();
+    }
+}
+
+pub fn start_barge_in_detection() {
+    if BARGE_IN_ENABLED.load(Ordering::SeqCst) {
+        BARGE_IN_STARTED_MS.store(now_millis(), Ordering::SeqCst);
+        BARGE_IN_ACTIVE.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn stop_barge_in_detection() {
+    BARGE_IN_ACTIVE.store(false, Ordering::SeqCst);
 }
 
 /// Signal that TTS started — capture should pause speech detection.
@@ -92,6 +126,8 @@ struct SpeechDetector {
     suppressed: bool,
     /// Silero VAD v5 engine (RMS fallback inside if ONNX unavailable).
     vad: super::vad::VadEngine,
+    pending_audio: Vec<i16>,
+    pending_deadline: Option<Instant>,
 }
 
 impl SpeechDetector {
@@ -103,6 +139,8 @@ impl SpeechDetector {
             sample_rate,
             suppressed: false,
             vad: super::vad::VadEngine::new(sample_rate),
+            pending_audio: Vec::new(),
+            pending_deadline: None,
         }
     }
 
@@ -128,13 +166,50 @@ impl SpeechDetector {
     }
 
     /// Reset detector state (called when TTS starts to flush any in-flight speech).
-    fn reset(&mut self) {
+    fn reset(&mut self) -> bool {
+        let released_stt_reservation = self.has_pending_audio();
         self.is_speaking = false;
         self.buffer.clear();
         self.silence_samples = 0;
+        self.pending_audio.clear();
+        self.pending_deadline = None;
+        released_stt_reservation
     }
 
-    fn process(&mut self, rms: f64, samples: &[i16]) -> Option<Vec<i16>> {
+    fn has_pending_audio(&self) -> bool {
+        !self.pending_audio.is_empty()
+    }
+
+    fn handle_vad_events(
+        &mut self,
+        events: Vec<super::vad::VadEvent>,
+        now: Instant,
+    ) -> Option<Vec<i16>> {
+        for event in events {
+            match event {
+                super::vad::VadEvent::SpeechStart => {
+                    if self.has_pending_audio() {
+                        self.pending_deadline = None;
+                    }
+                }
+                super::vad::VadEvent::SpeechEnd { audio_data } => {
+                    self.pending_audio.extend(audio_data);
+                    self.pending_deadline = Some(now + CONTINUATION_GRACE);
+                }
+            }
+        }
+
+        if self
+            .pending_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.pending_deadline = None;
+            return Some(std::mem::take(&mut self.pending_audio));
+        }
+        None
+    }
+
+    fn process(&mut self, rms: f64, samples: &[i16], now: Instant) -> Option<Vec<i16>> {
         // If suppressed, discard samples entirely
         if self.suppressed {
             return None;
@@ -142,11 +217,8 @@ impl SpeechDetector {
 
         if self.vad.is_silero_active() {
             // Silero path: engine handles downsampling, framing, hysteresis.
-            return match self.vad.process_samples(samples) {
-                Some(super::vad::VadEvent::SpeechEnd { audio_data }) => Some(audio_data),
-                Some(super::vad::VadEvent::SpeechStart) => None,
-                None => None,
-            };
+            let events = self.vad.process_samples(samples);
+            return self.handle_vad_events(events, now);
         }
 
         // Legacy RMS path (Silero model unavailable)
@@ -168,10 +240,46 @@ impl SpeechDetector {
                 self.is_speaking = false;
                 let data = std::mem::take(&mut self.buffer);
                 self.silence_samples = 0;
-                return Some(data);
+                return self.handle_vad_events(
+                    vec![super::vad::VadEvent::SpeechEnd { audio_data: data }],
+                    now,
+                );
             }
         }
-        None
+        self.handle_vad_events(Vec::new(), now)
+    }
+}
+
+struct BargeInDetector {
+    vad: super::vad::VadEngine,
+    consecutive_speech_frames: u32,
+}
+
+impl BargeInDetector {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            vad: super::vad::VadEngine::new(sample_rate),
+            consecutive_speech_frames: 0,
+        }
+    }
+
+    fn process(&mut self, samples: &[i16]) -> bool {
+        for probability in self.vad.process_probabilities(samples) {
+            if probability > BARGE_IN_THRESHOLD {
+                self.consecutive_speech_frames += 1;
+                if self.consecutive_speech_frames >= BARGE_IN_CONFIRM_FRAMES {
+                    self.consecutive_speech_frames = 0;
+                    return true;
+                }
+            } else {
+                self.consecutive_speech_frames = 0;
+            }
+        }
+        false
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_speech_frames = 0;
     }
 }
 
@@ -192,6 +300,7 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
     IS_CAPTURING.store(true, Ordering::SeqCst);
     let app_handle = app.clone();
     let detector = Mutex::new(SpeechDetector::new(sample_rate));
+    let barge_in_detector = Mutex::new(BargeInDetector::new(sample_rate));
 
     let stream = device
         .build_input_stream(
@@ -201,16 +310,33 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                     return;
                 }
 
-                // If mic is suspended (TTS playing), drop all samples immediately.
-                // No volume events, no RMS, no speech detection — complete silence to frontend.
-                if MIC_SUSPENDED.load(Ordering::SeqCst) {
-                    return;
-                }
-
                 let samples: Vec<i16> = data
                     .iter()
                     .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
                     .collect();
+
+                if MIC_SUSPENDED.load(Ordering::SeqCst) {
+                    let active = BARGE_IN_ACTIVE.load(Ordering::SeqCst);
+                    let past_guard = now_millis()
+                        .saturating_sub(BARGE_IN_STARTED_MS.load(Ordering::SeqCst))
+                        >= BARGE_IN_GUARD_MS;
+                    if active && past_guard {
+                        if let Ok(mut detector) = barge_in_detector.lock() {
+                            if detector.process(&samples)
+                                && BARGE_IN_ACTIVE.swap(false, Ordering::SeqCst)
+                            {
+                                let _ = app_handle.emit("barge-in:detected", serde_json::json!({}));
+                                if let Err(error) = crate::audio::player::reset_tts_queue() {
+                                    log::error!("Failed to reset TTS after barge-in: {}", error);
+                                }
+                                resume_mic_after_barge_in();
+                            }
+                        }
+                    } else if let Ok(mut detector) = barge_in_detector.lock() {
+                        detector.reset();
+                    }
+                    return;
+                }
 
                 // RMS volume
                 let sum: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
@@ -232,7 +358,9 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                         if should_suppress {
                             // TTS just started or is in cooldown — reset detector to flush
                             // any in-progress speech detection
-                            det.reset();
+                            if det.reset() {
+                                STT_IN_FLIGHT.store(false, Ordering::SeqCst);
+                            }
                         }
                         det.suppressed = should_suppress;
                     }
@@ -241,12 +369,12 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                         return;
                     }
 
-                    // Speech detection — only spawn STT if none is already in-flight
-                    if !STT_IN_FLIGHT.load(Ordering::SeqCst) {
-                        if let Some(audio_data) = det.process(rms, &samples) {
+                    // A pending grace-window utterance keeps VAD running even though
+                    // the STT reservation is already held.
+                    if !STT_IN_FLIGHT.load(Ordering::SeqCst) || det.has_pending_audio() {
+                        if let Some(audio_data) = det.process(rms, &samples, Instant::now()) {
                             let sr = det.output_rate();
                             let app = app_handle.clone();
-                            STT_IN_FLIGHT.store(true, Ordering::SeqCst);
                             std::thread::spawn(move || {
                                 let _ = app.emit(
                                     "audio:state",
@@ -255,6 +383,8 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                                 save_and_transcribe(&audio_data, sr, app);
                                 STT_IN_FLIGHT.store(false, Ordering::SeqCst);
                             });
+                        } else if det.has_pending_audio() {
+                            STT_IN_FLIGHT.store(true, Ordering::SeqCst);
                         }
                     }
                 }
@@ -278,9 +408,63 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
 pub async fn stop_mic_capture() -> Result<(), String> {
     IS_CAPTURING.store(false, Ordering::SeqCst);
     STT_IN_FLIGHT.store(false, Ordering::SeqCst);
+    stop_barge_in_detection();
     // Drop the stream to stop audio capture
     *ACTIVE_STREAM.lock().unwrap() = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuation_audio_waits_and_merges() {
+        let mut detector = SpeechDetector::new(48_000);
+        let start = Instant::now();
+        assert!(detector
+            .handle_vad_events(
+                vec![super::super::vad::VadEvent::SpeechEnd {
+                    audio_data: vec![1, 2]
+                }],
+                start,
+            )
+            .is_none());
+        assert!(detector.has_pending_audio());
+        assert!(detector
+            .handle_vad_events(
+                vec![super::super::vad::VadEvent::SpeechStart],
+                start + Duration::from_millis(500)
+            )
+            .is_none());
+        assert!(detector
+            .handle_vad_events(
+                vec![super::super::vad::VadEvent::SpeechEnd {
+                    audio_data: vec![3]
+                }],
+                start + Duration::from_millis(600),
+            )
+            .is_none());
+        assert_eq!(
+            detector.handle_vad_events(Vec::new(), start + Duration::from_millis(1800)),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn barge_in_requires_fourteen_consecutive_high_frames() {
+        let mut count = 0;
+        for _ in 0..13 {
+            count = if 0.9 > BARGE_IN_THRESHOLD {
+                count + 1
+            } else {
+                0
+            };
+            assert!(count < BARGE_IN_CONFIRM_FRAMES);
+        }
+        count += 1;
+        assert_eq!(count, BARGE_IN_CONFIRM_FRAMES);
+    }
 }
 
 fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
