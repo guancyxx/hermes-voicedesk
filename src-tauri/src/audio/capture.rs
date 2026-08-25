@@ -90,6 +90,8 @@ struct SpeechDetector {
     sample_rate: u32,
     /// When true, speech detection is fully suppressed (TTS playing or cooldown).
     suppressed: bool,
+    /// Silero VAD v5 engine (RMS fallback inside if ONNX unavailable).
+    vad: super::vad::VadEngine,
 }
 
 impl SpeechDetector {
@@ -100,6 +102,17 @@ impl SpeechDetector {
             silence_samples: 0,
             sample_rate,
             suppressed: false,
+            vad: super::vad::VadEngine::new(sample_rate),
+        }
+    }
+
+    /// Sample rate of the audio produced in SpeechEnd (16kHz when Silero VAD
+    /// is active, since it decimates to the model's expected rate).
+    fn output_rate(&self) -> u32 {
+        if self.vad.is_silero_active() {
+            16_000
+        } else {
+            self.sample_rate
         }
     }
 
@@ -127,6 +140,16 @@ impl SpeechDetector {
             return None;
         }
 
+        if self.vad.is_silero_active() {
+            // Silero path: engine handles downsampling, framing, hysteresis.
+            return match self.vad.process_samples(samples) {
+                Some(super::vad::VadEvent::SpeechEnd { audio_data }) => Some(audio_data),
+                Some(super::vad::VadEvent::SpeechStart) => None,
+                None => None,
+            };
+        }
+
+        // Legacy RMS path (Silero model unavailable)
         let is_loud = rms > 0.01;
 
         if is_loud {
@@ -139,7 +162,9 @@ impl SpeechDetector {
         } else if self.is_speaking {
             self.buffer.extend_from_slice(samples);
             self.silence_samples += samples.len() as u32;
-            if self.silence_samples >= self.silence_threshold() || self.buffer.len() > self.max_buffer() {
+            if self.silence_samples >= self.silence_threshold()
+                || self.buffer.len() > self.max_buffer()
+            {
                 self.is_speaking = false;
                 let data = std::mem::take(&mut self.buffer);
                 self.silence_samples = 0;
@@ -157,7 +182,9 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
 
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or("No microphone found")?;
-    let supported_config = device.default_input_config().map_err(|e| format!("Input config error: {}", e))?;
+    let supported_config = device
+        .default_input_config()
+        .map_err(|e| format!("Input config error: {}", e))?;
     let sample_rate: u32 = supported_config.sample_rate();
     log::info!("Mic: {}Hz", sample_rate);
 
@@ -180,7 +207,8 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                     return;
                 }
 
-                let samples: Vec<i16> = data.iter()
+                let samples: Vec<i16> = data
+                    .iter()
                     .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
                     .collect();
 
@@ -188,7 +216,10 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                 let sum: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
                 let rms = (sum / data.len() as f64).sqrt();
                 let pct = (rms.min(0.5) * 200.0) as u32;
-                let _ = app_handle.emit("audio:volume", serde_json::json!({ "rms": rms, "pct": pct }));
+                let _ = app_handle.emit(
+                    "audio:volume",
+                    serde_json::json!({ "rms": rms, "pct": pct }),
+                );
 
                 // Determine suppression state
                 let tts_active = is_tts_playing();
@@ -213,11 +244,14 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
                     // Speech detection — only spawn STT if none is already in-flight
                     if !STT_IN_FLIGHT.load(Ordering::SeqCst) {
                         if let Some(audio_data) = det.process(rms, &samples) {
-                            let sr = det.sample_rate;
+                            let sr = det.output_rate();
                             let app = app_handle.clone();
                             STT_IN_FLIGHT.store(true, Ordering::SeqCst);
                             std::thread::spawn(move || {
-                                let _ = app.emit("audio:state", serde_json::json!({ "state": "transcribing" }));
+                                let _ = app.emit(
+                                    "audio:state",
+                                    serde_json::json!({ "state": "transcribing" }),
+                                );
                                 save_and_transcribe(&audio_data, sr, app);
                                 STT_IN_FLIGHT.store(false, Ordering::SeqCst);
                             });
@@ -230,7 +264,9 @@ pub async fn start_mic_capture(app: AppHandle) -> Result<(), String> {
         )
         .map_err(|e| format!("Stream start error: {}", e))?;
 
-    stream.play().map_err(|e| format!("Stream play error: {}", e))?;
+    stream
+        .play()
+        .map_err(|e| format!("Stream play error: {}", e))?;
 
     // Store stream so stop_mic_capture can drop it
     *ACTIVE_STREAM.lock().unwrap() = Some(stream);
@@ -251,13 +287,24 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     use std::io::Write;
 
     let duration_secs = audio.len() as f32 / sample_rate as f32;
-    log::info!("STT: attempt start — {} samples, {:.2}s", audio.len(), duration_secs);
+    log::info!(
+        "STT: attempt start — {} samples, {:.2}s",
+        audio.len(),
+        duration_secs
+    );
 
     // ── Edge case 1: Empty or near-empty audio ──
     if audio.len() < sample_rate as usize / 10 {
         // Audio shorter than 100ms — likely a click or noise spike
-        log::info!("STT: skipping clip too short ({} samples, {:.2}s)", audio.len(), duration_secs);
-        let _ = app.emit("stt:result", serde_json::json!({ "text": "[too short]", "confidence": 0.0 }));
+        log::info!(
+            "STT: skipping clip too short ({} samples, {:.2}s)",
+            audio.len(),
+            duration_secs
+        );
+        let _ = app.emit(
+            "stt:result",
+            serde_json::json!({ "text": "[too short]", "confidence": 0.0 }),
+        );
         return;
     }
 
@@ -269,13 +316,19 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     if rms < 0.002 {
         // Very quiet — likely silence or room tone
         log::info!("STT: skipping near-silent clip (RMS={:.6})", rms);
-        let _ = app.emit("stt:result", serde_json::json!({ "text": "[silence]", "confidence": 0.0 }));
+        let _ = app.emit(
+            "stt:result",
+            serde_json::json!({ "text": "[silence]", "confidence": 0.0 }),
+        );
         return;
     }
 
     let dir = std::env::temp_dir().join("hermes-voicedesk");
     std::fs::create_dir_all(&dir).ok();
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
     let path = dir.join(format!("speech_{}.wav", ts));
 
     let mut wav = Vec::new();
@@ -293,11 +346,19 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_size.to_le_bytes());
-    for &s in audio { wav.extend_from_slice(&s.to_le_bytes()); }
+    for &s in audio {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
 
     std::fs::write(&path, &wav).ok();
     let duration_secs = audio.len() as f32 / sample_rate as f32;
-    log::info!("Saved speech: {} ({} samples, {:.1}s, RMS={:.4})", path.display(), audio.len(), duration_secs, rms);
+    log::info!(
+        "Saved speech: {} ({} samples, {:.1}s, RMS={:.4})",
+        path.display(),
+        audio.len(),
+        duration_secs,
+        rms
+    );
 
     let path_str = path.to_string_lossy().to_string();
 
@@ -305,7 +366,10 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     match crate::stt::siri::transcribe_file(&path_str) {
         Some(text) if !text.is_empty() => {
             log::info!("STT (Siri): text={}", text);
-            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": 0.85, "engine": "siri" }));
+            let _ = app.emit(
+                "stt:result",
+                serde_json::json!({ "text": text, "confidence": 0.85, "engine": "siri" }),
+            );
             return;
         }
         Some(_) => {
@@ -320,12 +384,21 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
     match transcribe_with_whisper(&path_str) {
         Some((text, confidence)) if confidence > 0.3 => {
             log::info!("STT (whisper): confidence={:.3} text={}", confidence, text);
-            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": confidence, "engine": "whisper" }));
+            let _ = app.emit(
+                "stt:result",
+                serde_json::json!({ "text": text, "confidence": confidence, "engine": "whisper" }),
+            );
             return;
         }
         Some((text, confidence)) => {
-            log::warn!("STT (whisper): low confidence={:.3}, using as last resort", confidence);
-            let _ = app.emit("stt:result", serde_json::json!({ "text": text, "confidence": confidence, "engine": "whisper" }));
+            log::warn!(
+                "STT (whisper): low confidence={:.3}, using as last resort",
+                confidence
+            );
+            let _ = app.emit(
+                "stt:result",
+                serde_json::json!({ "text": text, "confidence": confidence, "engine": "whisper" }),
+            );
             return;
         }
         None => {
@@ -333,7 +406,10 @@ fn save_and_transcribe(audio: &[i16], sample_rate: u32, app: AppHandle) {
         }
     }
 
-    let _ = app.emit("stt:result", serde_json::json!({ "text": "[no speech detected]", "confidence": 0.0, "engine": "none" }));
+    let _ = app.emit(
+        "stt:result",
+        serde_json::json!({ "text": "[no speech detected]", "confidence": 0.0, "engine": "none" }),
+    );
 }
 
 /// Returns (text, confidence) or None on failure.
@@ -369,7 +445,11 @@ except Exception as e:
         path
     );
 
-    match std::process::Command::new("python3").arg("-c").arg(&script).output() {
+    match std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .output()
+    {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -382,7 +462,11 @@ except Exception as e:
             }
             match serde_json::from_str::<serde_json::Value>(&stdout) {
                 Ok(v) => {
-                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let text = v
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let confidence = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
                     let error = v.get("error").and_then(|e| e.as_str());
                     if let Some(err) = error {

@@ -48,7 +48,9 @@
     ],
     "resources": [
       "../target/release/macos-stt-helper",
-      "resources/jarvis-persona.md"
+      "resources/jarvis-persona.md",
+      "resources/silero_vad.onnx",
+      "scripts/qwen3_tts.py"
     ],
     "createUpdaterArtifacts": false,
     "category": "Productivity",
