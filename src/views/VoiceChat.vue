@@ -663,6 +663,7 @@ async function startNewSession() {
   isTtsActive = false
   isProcessing = false
   responseFinished = false
+  toolCalls.value = []
   if (stagedFlushTimer !== null) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
@@ -674,7 +675,6 @@ async function startNewSession() {
 
   isListening.value = false
   messages.value = []
-  toolCalls.value = []
 
   const now = new Date().toISOString()
   sessionId.value = `voice-${now.slice(0, 10)}-${now.slice(11, 16).replace(':', '')}`
