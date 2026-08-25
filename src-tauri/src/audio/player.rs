@@ -60,6 +60,11 @@ static QUEUE_CV: Condvar = Condvar::new();
 /// Handle to the currently-running child process so we can kill it before starting a new one.
 static CURRENT_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Playback epoch: bumped before every playback stop. A player captures this
+/// before spawning and re-checks it after registering in CURRENT_CHILD so a
+/// process spawned concurrently with reset cannot escape the stop snapshot.
+static PLAYBACK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Generation epoch: bumped by every reset_tts_queue(). Generation threads
 /// capture the epoch at start; a killed sub-process returning failure must NOT
 /// fall back to spawning a NEW sub-process (say/ffmpeg) after a reset — that
@@ -1217,6 +1222,10 @@ pub fn reset_tts_queue() -> Result<(), String> {
         was_active
     };
     QUEUE_CV.notify_all();
+    // Bump before taking CURRENT_CHILD. A concurrent play_file either registers
+    // before our take (and is killed here), or registers afterwards, observes
+    // the changed epoch while holding the same lock, and kills itself.
+    PLAYBACK_EPOCH.fetch_add(1, Ordering::SeqCst);
     stop_child_process();
     // Cancel barrier FIRST: bump the epoch so in-flight generation threads
     // that get killed here do not fall back to spawning new sub-processes,
@@ -1235,12 +1244,25 @@ pub fn reset_tts_queue() -> Result<(), String> {
 /// Play an audio file, blocking until playback completes.
 /// Uses the CURRENT_CHILD mechanism so playback can be interrupted.
 fn play_file(path: &str) -> Result<(), String> {
+    let epoch_at_spawn = PLAYBACK_EPOCH.load(Ordering::SeqCst);
     let child = Command::new("afplay")
         .arg(path)
         .spawn()
         .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
 
-    *CURRENT_CHILD.lock().unwrap() = Some(child);
+    // Register BEFORE checking the epoch. Registration and reset's kill
+    // snapshot both take CURRENT_CHILD, so the spawned process is covered by
+    // one side of the barrier regardless of which acquires the lock first.
+    let mut current = CURRENT_CHILD.lock().unwrap();
+    *current = Some(child);
+    if playback_was_cancelled(epoch_at_spawn, PLAYBACK_EPOCH.load(Ordering::SeqCst)) {
+        if let Some(mut cancelled) = current.take() {
+            let _ = cancelled.kill();
+            let _ = cancelled.wait();
+        }
+        return Ok(());
+    }
+    drop(current);
 
     loop {
         let mut current = CURRENT_CHILD.lock().unwrap();
@@ -1262,6 +1284,10 @@ fn play_file(path: &str) -> Result<(), String> {
         drop(current);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+fn playback_was_cancelled(epoch_at_spawn: u64, current_epoch: u64) -> bool {
+    epoch_at_spawn != current_epoch
 }
 
 /// Finalize TTS: emit completion events and resume mic.
@@ -1313,4 +1339,24 @@ pub fn stop() -> Result<(), String> {
     // `stop` also cancels legacy speak/speak_batch generations; queue resets do not.
     TTS_GENERATION.fetch_add(1, Ordering::SeqCst);
     reset_tts_queue()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_was_cancelled;
+
+    #[test]
+    fn playback_spawned_across_reset_is_cancelled() {
+        let epoch_before_spawn = 41;
+        let epoch_after_reset = epoch_before_spawn + 1;
+
+        assert!(playback_was_cancelled(
+            epoch_before_spawn,
+            epoch_after_reset
+        ));
+        assert!(!playback_was_cancelled(
+            epoch_after_reset,
+            epoch_after_reset
+        ));
+    }
 }

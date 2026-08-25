@@ -80,6 +80,11 @@ let stagedFlushTimer: ReturnType<typeof setTimeout> | null = null
 // echo / residual buffer) and must NOT start a new conversation turn.
 let lastTtsCompleteAt = 0
 
+function resetStagedTtsState() {
+  queuedSegmentText.clear()
+  nextQueuedSegmentIndex = 0
+}
+
 // Hidden buffer that accumulates ALL deltas (full response text for history save)
 const fullResponseText = ref('')
 
@@ -209,6 +214,7 @@ async function flushPendingSegment(final: boolean) {
     isTtsActive = false
     if (segmentIndex !== null) revealSegment(segmentIndex)
     await invoke('reset_tts_queue').catch(() => {})
+    resetStagedTtsState()
   }
 }
 
@@ -431,8 +437,7 @@ onMounted(async () => {
       stagedFlushTimer = null
     }
     pendingSentences.length = 0
-    queuedSegmentText.clear()
-    nextQueuedSegmentIndex = 0
+    resetStagedTtsState()
     isTtsActive = false
     sentenceBuffer.value = ''
     fullResponseText.value = ''
@@ -565,6 +570,7 @@ onMounted(async () => {
       stagedFlushTimer = null
     }
     invoke('reset_tts_queue').catch(() => {})
+    resetStagedTtsState()
     enterWakeMode()
   })
 
@@ -594,7 +600,7 @@ onMounted(async () => {
     isProcessing = false
     responseFinished = false
     pendingSentences.length = 0
-    queuedSegmentText.clear()
+    resetStagedTtsState()
     sentenceBuffer.value = ''
     state.value = 'listening'
   })
@@ -623,8 +629,7 @@ async function startListening() {
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   pendingSentences.length = 0
-  queuedSegmentText.clear()
-  nextQueuedSegmentIndex = 0
+  resetStagedTtsState()
   isTtsActive = false
   isProcessing = false
   responseFinished = false
@@ -647,6 +652,7 @@ async function toggleListening() {
 
 async function startNewSession() {
   await invoke('reset_tts_queue').catch(() => {})
+  resetStagedTtsState()
   await invoke('stop_listening').catch(() => {})
   await invoke('stop_wake_word').catch(() => {})
 
@@ -654,8 +660,6 @@ async function startNewSession() {
   messages.value = []
   toolCalls.value = []
   pendingSentences.length = 0
-  queuedSegmentText.clear()
-  nextQueuedSegmentIndex = 0
   sentenceBuffer.value = ''
   fullResponseText.value = ''
   isTtsActive = false
@@ -686,6 +690,7 @@ async function sendText() {
   // Stop wake word
   await invoke('stop_wake_word')
   await invoke('reset_tts_queue')
+  resetStagedTtsState()
   if (stagedFlushTimer !== null) {
     clearTimeout(stagedFlushTimer)
     stagedFlushTimer = null
